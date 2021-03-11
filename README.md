@@ -1,4 +1,4 @@
-## TransGanFormer
+## TransGanFormer (wip)
 
 Implementation of TransGanFormer, an all-attention GAN that combines the finding from the recent GanFormer and TransGan paper. It will also contain a bunch of tricks I have picked up building transformers and GANs for the last year or so, including efficent linear attention and pixel level attention.
 
