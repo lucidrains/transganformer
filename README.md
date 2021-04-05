@@ -2,6 +2,18 @@
 
 Implementation of TransGanFormer, an all-attention GAN that combines the finding from the recent <a href="https://arxiv.org/abs/2103.01209">GansFormer</a> and <a href="https://arxiv.org/abs/2102.07074">TransGan</a> paper. It will also contain a bunch of tricks I have picked up building transformers and GANs for the last year or so, including efficient linear attention and pixel level attention.
 
+## Install
+
+```bash
+$ pip install transganformer
+```
+
+## Usage
+
+```bash
+$ transganformer --data ./path/to/data
+```
+
 ## Citations
 
 ```bibtex
