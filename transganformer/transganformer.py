@@ -24,8 +24,8 @@ import torchvision
 from torchvision import transforms
 from kornia import filter2D
 
-from lightweight_gan.diff_augment import DiffAugment
-from lightweight_gan.version import __version__
+from transganformer.diff_augment import DiffAugment
+from transganformer.version import __version__
 
 from tqdm import tqdm
 from einops import rearrange, reduce, repeat
@@ -740,7 +740,7 @@ class Discriminator(nn.Module):
 
         return out, out_32x32, aux_loss
 
-class LightweightGAN(nn.Module):
+class Transganformer(nn.Module):
     def __init__(
         self,
         *,
@@ -973,7 +973,7 @@ class Trainer():
 
         # instantiate GAN
 
-        self.GAN = LightweightGAN(
+        self.GAN = Transganformer(
             optimizer=self.optimizer,
             lr = self.lr,
             latent_dim = self.latent_dim,
