@@ -44,6 +44,9 @@ EXTS = ['jpg', 'jpeg', 'png']
 def exists(val):
     return val is not None
 
+def default(val, d):
+    return val if exists(val) else d
+
 @contextmanager
 def null_context():
     yield
@@ -235,6 +238,7 @@ class Attention(nn.Module):
     def __init__(
         self,
         dim,
+        kv_dim = None,
         heads = 8,
         dim_head = 64,
         q_kernel_size = 1,
@@ -242,6 +246,7 @@ class Attention(nn.Module):
     ):
         super().__init__()
         inner_dim = dim_head *  heads
+        kv_dim = default(kv_dim, dim)
         self.heads = heads
         self.scale = dim_head ** -0.5
 
@@ -249,16 +254,18 @@ class Attention(nn.Module):
         kv_padding = kv_kernel_size // 2
 
         self.to_q = nn.Conv2d(dim, inner_dim, q_kernel_size, padding = q_padding, bias = False)
-        self.to_kv = nn.Conv2d(dim, inner_dim * 2, kv_kernel_size, padding = kv_padding, bias = False)
+        self.to_kv = nn.Conv2d(kv_dim, inner_dim * 2, kv_kernel_size, padding = kv_padding, bias = False)
 
         self.to_out = nn.Sequential(
             nn.GELU(),
             nn.Conv2d(inner_dim, dim, 1)
         )
 
-    def forward(self, x, mask = None):
+    def forward(self, x, context = None, mask = None):
         b, n, _, y, h, device = *x.shape, self.heads, x.device
-        qkv = (self.to_q(x), *self.to_kv(x).chunk(2, dim = 1))
+        context = default(context, x)
+
+        qkv = (self.to_q(x), *self.to_kv(context).chunk(2, dim = 1))
         q, k, v = map(lambda t: rearrange(t, 'b (h d) x y -> (b h) (x y) d', h = h), qkv)
 
         dots = torch.einsum('b i d, b j d -> b i j', q, k) * self.scale
@@ -587,13 +594,11 @@ class Discriminator(nn.Module):
         fmap_max = 512,
         fmap_inverse_coef = 12,
         transparent = False,
-        greyscale = False,
-        disc_output_size = 5
+        greyscale = False
     ):
         super().__init__()
         resolution = log2(image_size)
         assert is_power_of_two(image_size), 'image size must be a power of 2'
-        assert disc_output_size in {1, 5}, 'discriminator output dimensions can only be 5x5 or 1x1'
 
         resolution = int(resolution)
 
@@ -654,45 +659,15 @@ class Discriminator(nn.Module):
             ]))
 
         last_chan = features[-1][-1]
-        if disc_output_size == 5:
-            self.to_logits = nn.Sequential(
-                nn.Conv2d(last_chan, last_chan, 1),
-                nn.LeakyReLU(0.1),
-                nn.Conv2d(last_chan, 1, 4)
-            )
-        elif disc_output_size == 1:
-            self.to_logits = nn.Sequential(
-                Blur(),
-                nn.Conv2d(last_chan, last_chan, 3, stride = 2, padding = 1),
-                nn.LeakyReLU(0.1),
-                nn.Conv2d(last_chan, 1, 4)
-            )
 
-        self.to_shape_disc_out = nn.Sequential(
-            nn.Conv2d(init_channel, 64, 3, padding = 1),
-            Residual(LayerScale(64, LinearAttention(64))),
-            SumBranches([
-                nn.Sequential(
-                    Blur(),
-                    nn.Conv2d(64, 32, 4, stride = 2, padding = 1),
-                    nn.LeakyReLU(0.1),
-                    nn.Conv2d(32, 32, 3, padding = 1),
-                    nn.LeakyReLU(0.1)
-                ),
-                nn.Sequential(
-                    Blur(),
-                    nn.AvgPool2d(2),
-                    nn.Conv2d(64, 32, 1),
-                    nn.LeakyReLU(0.1),
-                )
-            ]),
-            Residual(LayerScale(32, LinearAttention(32))),
-            nn.AdaptiveAvgPool2d((4, 4)),
-            nn.Conv2d(32, 1, 4)
+        self.to_logits = nn.Sequential(
+            Blur(),
+            nn.Conv2d(last_chan, last_chan, 3, stride = 2, padding = 1),
+            nn.LeakyReLU(0.1),
+            nn.Conv2d(last_chan, 1, 4)
         )
 
-        self.decoder1 = SimpleDecoder(chan_in = last_chan, chan_out = init_channel)
-        self.decoder2 = SimpleDecoder(chan_in = features[-2][-1], chan_out = init_channel) if resolution >= 9 else None
+        self.decoder = SimpleDecoder(chan_in = last_chan, chan_out = init_channel)
 
     def forward(self, x, calc_aux_loss = False):
         orig_img = x
@@ -711,39 +686,21 @@ class Discriminator(nn.Module):
 
         out = self.to_logits(x).flatten(1)
 
-        img_32x32 = F.interpolate(orig_img, size = (32, 32))
-        out_32x32 = self.to_shape_disc_out(img_32x32)
-
         if not calc_aux_loss:
-            return out, out_32x32, None
+            return out, None
 
         # self-supervised auto-encoding loss
 
         layer_8x8 = layer_outputs[-1]
-        layer_16x16 = layer_outputs[-2]
 
-        recon_img_8x8 = self.decoder1(layer_8x8)
+        recon_img_8x8 = self.decoder(layer_8x8)
 
         aux_loss = F.mse_loss(
             recon_img_8x8,
             F.interpolate(orig_img, size = recon_img_8x8.shape[2:])
         )
 
-        if exists(self.decoder2):
-            select_random_quadrant = lambda rand_quadrant, img: rearrange(img, 'b c (m h) (n w) -> (m n) b c h w', m = 2, n = 2)[rand_quadrant]
-            crop_image_fn = partial(select_random_quadrant, floor(random() * 4))
-            img_part, layer_16x16_part = map(crop_image_fn, (orig_img, layer_16x16))
-
-            recon_img_16x16 = self.decoder2(layer_16x16_part)
-
-            aux_loss_16x16 = F.mse_loss(
-                recon_img_16x16,
-                F.interpolate(img_part, size = recon_img_16x16.shape[2:])
-            )
-
-            aux_loss = aux_loss + aux_loss_16x16
-
-        return out, out_32x32, aux_loss
+        return out, aux_loss
 
 class Transganformer(nn.Module):
     def __init__(
@@ -755,7 +712,6 @@ class Transganformer(nn.Module):
         fmap_inverse_coef = 12,
         transparent = False,
         greyscale = False,
-        disc_output_size = 5,
         ttur_mult = 1.,
         lr = 2e-4,
         rank = 0,
@@ -781,8 +737,7 @@ class Transganformer(nn.Module):
             fmap_max = fmap_max,
             fmap_inverse_coef = fmap_inverse_coef,
             transparent = transparent,
-            greyscale = greyscale,
-            disc_output_size = disc_output_size
+            greyscale = greyscale
         )
 
         self.ema_updater = EMA(0.995)
@@ -839,7 +794,6 @@ class Trainer():
         batch_size = 4,
         gp_weight = 10,
         gradient_accumulate_every = 1,
-        disc_output_size = 5,
         dual_contrast_loss = False,
         antialias = False,
         lr = 2e-4,
@@ -876,8 +830,6 @@ class Trainer():
 
         assert is_power_of_two(image_size), 'image size must be a power of 2 (64, 128, 256, 512, 1024)'
 
-        assert not (dual_contrast_loss and disc_output_size > 1), 'discriminator output size cannot be greater than 1 if using dual contrastive loss'
-
         self.image_size = image_size
         self.num_image_tiles = num_image_tiles
 
@@ -903,7 +855,6 @@ class Trainer():
         self.save_every = save_every
         self.steps = 0
 
-        self.disc_output_size = disc_output_size
         self.antialias = antialias
 
         self.dual_contrast_loss = dual_contrast_loss
@@ -957,7 +908,6 @@ class Trainer():
             image_size = self.image_size,
             ttur_mult = self.ttur_mult,
             fmap_max = self.fmap_max,
-            disc_output_size = self.disc_output_size,
             transparent = self.transparent,
             greyscale = self.greyscale,
             rank = self.rank,
@@ -979,7 +929,6 @@ class Trainer():
         config = self.config() if not self.config_path.exists() else json.loads(self.config_path.read_text())
         self.image_size = config['image_size']
         self.transparent = config['transparent']
-        self.disc_output_size = config['disc_output_size']
         self.greyscale = config.pop('greyscale', False)
         self.fmap_max = config.pop('fmap_max', 512)
         del self.GAN
@@ -989,8 +938,7 @@ class Trainer():
         return {
             'image_size': self.image_size,
             'transparent': self.transparent,
-            'greyscale': self.greyscale,
-            'disc_output_size': self.disc_output_size,
+            'greyscale': self.greyscale
         }
 
     def set_data_src(self, folder):
@@ -1055,22 +1003,21 @@ class Trainer():
                 with torch.no_grad():
                     generated_images = G(latents)
 
-                fake_output, fake_output_32x32, _ = D_aug(generated_images, detach = True, **aug_kwargs)
+                fake_output, _ = D_aug(generated_images, detach = True, **aug_kwargs)
 
-                real_output, real_output_32x32, real_aux_loss = D_aug(image_batch,  calc_aux_loss = True, **aug_kwargs)
+                real_output, real_aux_loss = D_aug(image_batch,  calc_aux_loss = True, **aug_kwargs)
 
                 real_output_loss = real_output
                 fake_output_loss = fake_output
 
                 divergence = D_loss_fn(real_output_loss, fake_output_loss)
-                divergence_32x32 = D_loss_fn(real_output_32x32, fake_output_32x32)
-                disc_loss = divergence + divergence_32x32
+                disc_loss = divergence
 
                 aux_loss = real_aux_loss
                 disc_loss = disc_loss + aux_loss
 
             if apply_gradient_penalty:
-                outputs = [real_output, real_output_32x32]
+                outputs = [real_output]
                 outputs = list(map(self.D_scaler.scale, outputs)) if self.amp else outputs
 
                 scaled_gradients = torch_grad(outputs=outputs, inputs=image_batch,
@@ -1125,13 +1072,12 @@ class Trainer():
             with amp_context():
                 generated_images = G(latents)
 
-                fake_output, fake_output_32x32, _ = D_aug(generated_images, **aug_kwargs)
-                real_output, real_output_32x32, _ = D_aug(image_batch, **aug_kwargs) if G_requires_calc_real else (None, None, None)
+                fake_output, _ = D_aug(generated_images, **aug_kwargs)
+                real_output, _ = D_aug(image_batch, **aug_kwargs) if G_requires_calc_real else (None, None, None)
 
                 loss = G_loss_fn(fake_output, real_output)
-                loss_32x32 = G_loss_fn(fake_output_32x32, real_output_32x32)
 
-                gen_loss = loss + loss_32x32
+                gen_loss = loss
 
                 gen_loss = gen_loss / self.gradient_accumulate_every
 
