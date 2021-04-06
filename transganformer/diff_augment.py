@@ -1,15 +1,12 @@
 import random
-
 import torch
 import torch.nn.functional as F
-
 
 def DiffAugment(x, types=[]):
     for p in types:
         for f in AUGMENT_FNS[p]:
             x = f(x)
     return x.contiguous()
-
 
 # """
 # Augmentation functions got images as `x`
@@ -93,10 +90,10 @@ def rand_cutout(x, ratio=0.5):
     return x
 
 AUGMENT_FNS = {
-    'color': [rand_brightness, rand_saturation, rand_contrast],
-    'offset': [rand_offset],
-    'offset_h': [rand_offset_h],
-    'offset_v': [rand_offset_v],
-    'translation': [rand_translation],
-    'cutout': [rand_cutout],
+    'color':        [rand_brightness, rand_saturation, rand_contrast],
+    'offset':       [rand_offset],
+    'offset_h':     [rand_offset_h],
+    'offset_v':     [rand_offset_v],
+    'translation':  [rand_translation],
+    'cutout':       [rand_cutout],
 }
