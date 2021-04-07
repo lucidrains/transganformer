@@ -29,6 +29,7 @@ from transganformer.version import __version__
 
 from tqdm import tqdm
 from einops import rearrange, reduce, repeat
+from einops.layers.torch import Rearrange
 
 # asserts
 
@@ -157,16 +158,6 @@ class RandomApply(nn.Module):
         fn = self.fn if random() < self.prob else self.fn_else
         return fn(x)
 
-class LayerScale(nn.Module):
-    def __init__(self, dim, fn):
-        super().__init__()
-        self.fn = fn
-        scale = torch.zeros(1, dim, 1, 1).fill_(1e-3)
-        self.g = nn.Parameter(scale)
-
-    def forward(self, x):
-        return self.g * self.fn(x)
-
 class Residual(nn.Module):
     def __init__(self, fn):
         super().__init__()
@@ -174,23 +165,6 @@ class Residual(nn.Module):
 
     def forward(self, x):
         return self.fn(x) + x
-
-class SumBranches(nn.Module):
-    def __init__(self, branches):
-        super().__init__()
-        self.branches = nn.ModuleList(branches)
-    def forward(self, x):
-        return sum(map(lambda fn: fn(x), self.branches))
-
-class Blur(nn.Module):
-    def __init__(self):
-        super().__init__()
-        f = torch.Tensor([1, 2, 1])
-        self.register_buffer('f', f)
-    def forward(self, x):
-        f = self.f
-        f = f[None, None, :] * f [None, :, None]
-        return filter2D(x, f, normalized=True)
 
 # attention and transformer modules
 
@@ -464,97 +438,18 @@ class Generator(nn.Module):
         latent_dim = 256,
         fmap_max = 512,
         fmap_inverse_coef = 12,
-        transparent = False,
-        greyscale = False        
+        init_channels = 3
     ):
         super().__init__()
         resolution = log2(image_size)
         assert is_power_of_two(image_size), 'image size must be a power of 2'
-
-        if transparent:
-            init_channel = 4
-        elif greyscale:
-            init_channel = 1
-        else:
-            init_channel = 3
-
-        fmap_max = default(fmap_max, latent_dim)
-
-        self.initial_conv = nn.Sequential(
-            nn.ConvTranspose2d(latent_dim, latent_dim * 2, 4),
-            norm_class(latent_dim * 2),
-            nn.GLU(dim = 1)
-        )
-
-        num_layers = int(resolution) - 2
-        features = list(map(lambda n: (n,  2 ** (fmap_inverse_coef - n)), range(2, num_layers + 2)))
-        features = list(map(lambda n: (n[0], min(n[1], fmap_max)), features))
-        features = list(map(lambda n: 3 if n[0] >= 8 else n[1], features))
-        features = [latent_dim, *features]
-
-        in_out_features = list(zip(features[:-1], features[1:]))
-
-        self.res_layers = range(2, num_layers + 2)
-        self.layers = nn.ModuleList([])
-        self.res_to_feature_map = dict(zip(self.res_layers, in_out_features))
-
-        self.sle_map = ((3, 7), (4, 8), (5, 9), (6, 10))
-        self.sle_map = list(filter(lambda t: t[0] <= resolution and t[1] <= resolution, self.sle_map))
-        self.sle_map = dict(self.sle_map)
-
-        self.num_layers_spatial_res = 1
-
-        for (res, (chan_in, chan_out)) in zip(self.res_layers, in_out_features):
-            image_width = 2 ** res
-
-            sle = None
-            if res in self.sle_map:
-                residual_layer = self.sle_map[res]
-                sle_chan_out = self.res_to_feature_map[residual_layer - 1][-1]
-
-                sle = GlobalContext(
-                    chan_in = chan_out,
-                    chan_out = sle_chan_out
-                )
-
-            layer = nn.ModuleList([
-                nn.Sequential(
-                    upsample(),
-                    Blur(),
-                    nn.Conv2d(chan_in, chan_out * 2, 3, padding = 1),
-                    norm_class(chan_out * 2),
-                    nn.GLU(dim = 1)
-                ),
-                sle,
-                attn
-            ])
-            self.layers.append(layer)
-
-        self.out_conv = nn.Conv2d(features[-1], init_channel, 3, padding = 1)
 
     def forward(self, x):
         x = rearrange(x, 'b c -> b c () ()')
         x = self.initial_conv(x)
         x = F.normalize(x, dim = 1)
 
-        residuals = dict()
-
-        for (res, (up, sle, attn)) in zip(self.res_layers, self.layers):
-            if exists(attn):
-                x = attn(x) + x
-
-            x = up(x)
-
-            if exists(sle):
-                out_res = self.sle_map[res]
-                residual = sle(x)
-                residuals[out_res] = residual
-
-            next_res = res + 1
-            if next_res in residuals:
-                x = x * residuals[next_res]
-
-        return self.out_conv(x)
+        return
 
 class SimpleDecoder(nn.Module):
     def __init__(
@@ -609,66 +504,6 @@ class Discriminator(nn.Module):
         else:
             init_channel = 3
 
-        num_non_residual_layers = max(0, int(resolution) - 8)
-        num_residual_layers = 8 - 3
-
-        non_residual_resolutions = range(min(8, resolution), 2, -1)
-        features = list(map(lambda n: (n,  2 ** (fmap_inverse_coef - n)), non_residual_resolutions))
-        features = list(map(lambda n: (n[0], min(n[1], fmap_max)), features))
-
-        if num_non_residual_layers == 0:
-            res, _ = features[0]
-            features[0] = (res, init_channel)
-
-        chan_in_out = list(zip(features[:-1], features[1:]))
-
-        self.non_residual_layers = nn.ModuleList([])
-        for ind in range(num_non_residual_layers):
-            first_layer = ind == 0
-            last_layer = ind == (num_non_residual_layers - 1)
-            chan_out = features[0][-1] if last_layer else init_channel
-
-            self.non_residual_layers.append(nn.Sequential(
-                Blur(),
-                nn.Conv2d(init_channel, chan_out, 4, stride = 2, padding = 1),
-                nn.LeakyReLU(0.1)
-            ))
-
-        self.residual_layers = nn.ModuleList([])
-
-        for (res, ((_, chan_in), (_, chan_out))) in zip(non_residual_resolutions, chan_in_out):
-            image_width = 2 ** res
-
-            self.residual_layers.append(nn.ModuleList([
-                SumBranches([
-                    nn.Sequential(
-                        Blur(),
-                        nn.Conv2d(chan_in, chan_out, 4, stride = 2, padding = 1),
-                        nn.LeakyReLU(0.1),
-                        nn.Conv2d(chan_out, chan_out, 3, padding = 1),
-                        nn.LeakyReLU(0.1)
-                    ),
-                    nn.Sequential(
-                        Blur(),
-                        nn.AvgPool2d(2),
-                        nn.Conv2d(chan_in, chan_out, 1),
-                        nn.LeakyReLU(0.1),
-                    )
-                ]),
-                attn
-            ]))
-
-        last_chan = features[-1][-1]
-
-        self.to_logits = nn.Sequential(
-            Blur(),
-            nn.Conv2d(last_chan, last_chan, 3, stride = 2, padding = 1),
-            nn.LeakyReLU(0.1),
-            nn.Conv2d(last_chan, 1, 4)
-        )
-
-        self.decoder = SimpleDecoder(chan_in = last_chan, chan_out = init_channel)
-
     def forward(self, x, calc_aux_loss = False):
         orig_img = x
 
@@ -677,10 +512,7 @@ class Discriminator(nn.Module):
 
         layer_outputs = []
 
-        for (net, attn) in self.residual_layers:
-            if exists(attn):
-                x = attn(x) + x
-
+        for net in self.residual_layers:
             x = net(x)
             layer_outputs.append(x)
 
@@ -721,13 +553,19 @@ class Transganformer(nn.Module):
         self.latent_dim = latent_dim
         self.image_size = image_size
 
+        if transparent:
+            init_channel = 4
+        elif greyscale:
+            init_channel = 1
+        else:
+            init_channel = 3
+
         G_kwargs = dict(
             image_size = image_size,
             latent_dim = latent_dim,
             fmap_max = fmap_max,
             fmap_inverse_coef = fmap_inverse_coef,
-            transparent = transparent,
-            greyscale = greyscale
+            init_channel = init_channel
         )
 
         self.G = Generator(**G_kwargs)
@@ -737,7 +575,8 @@ class Transganformer(nn.Module):
             fmap_max = fmap_max,
             fmap_inverse_coef = fmap_inverse_coef,
             transparent = transparent,
-            greyscale = greyscale
+            greyscale = greyscale,
+            init_channel = init_channel
         )
 
         self.ema_updater = EMA(0.995)
@@ -795,7 +634,6 @@ class Trainer():
         gp_weight = 10,
         gradient_accumulate_every = 1,
         dual_contrast_loss = False,
-        antialias = False,
         lr = 2e-4,
         lr_mlp = 1.,
         ttur_mult = 1.,
@@ -855,8 +693,6 @@ class Trainer():
         self.save_every = save_every
         self.steps = 0
 
-        self.antialias = antialias
-
         self.dual_contrast_loss = dual_contrast_loss
 
         self.d_loss = 0
@@ -893,12 +729,6 @@ class Trainer():
         
     def init_GAN(self):
         args, kwargs = self.GAN_params
-
-        # set some global variables before instantiating GAN
-
-        global Blur
-
-        Blur = nn.Identity if not self.antialias else Blur
 
         # instantiate GAN
 
