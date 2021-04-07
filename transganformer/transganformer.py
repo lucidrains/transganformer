@@ -459,7 +459,7 @@ class Generator(nn.Module):
         latent_dim = 256,
         fmap_max = 512,
         fmap_inverse_coef = 12,
-        init_channels = 3,
+        init_channel = 3,
         mapping_network_depth = 4
     ):
         super().__init__()
@@ -512,24 +512,44 @@ class Discriminator(nn.Module):
         self,
         *,
         image_size,
-        fmap_max = 512,
+        fmap_max = 256,
         fmap_inverse_coef = 12,
-        transparent = False,
-        greyscale = False
+        init_channel = 3,
     ):
         super().__init__()
-        resolution = log2(image_size)
         assert is_power_of_two(image_size), 'image size must be a power of 2'
+        num_layers = int(log2(image_size)) - 2
 
-        resolution = int(resolution)
+        self.conv_embed = nn.Conv2d(init_channel, fmap_max, kernel_size = 7, stride = 4, padding = 3)
+
+        self.layers = nn.ModuleList([])
+        for _ in range(num_layers):
+            self.layers.append(nn.ModuleList([
+                Residual(PreNorm(fmap_max, Attention(dim = fmap_max))),
+                Residual(PreNorm(fmap_max, FeedForward(dim = fmap_max)))
+            ]))
+
+        self.to_logits = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            Rearrange('b c () () -> b c'),
+            nn.Linear(fmap_max, 1),
+            Rearrange('b () -> b')
+        )
 
     def forward(self, x, calc_aux_loss = False):
         x_ = x
+        x = self.conv_embed(x)
+
+        for (attn, ff) in self.layers:
+            x = attn(x)
+            x = ff(x)
+
+        x = self.to_logits(x)
 
         if not calc_aux_loss:
-            return out, None
+            return x, None
 
-        return out, 0
+        return x, 0
 
 class Transganformer(nn.Module):
     def __init__(
@@ -571,8 +591,6 @@ class Transganformer(nn.Module):
             image_size = image_size,
             fmap_max = fmap_max,
             fmap_inverse_coef = fmap_inverse_coef,
-            transparent = transparent,
-            greyscale = greyscale,
             init_channel = init_channel
         )
 
