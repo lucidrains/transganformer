@@ -398,7 +398,7 @@ def upsample(scale_factor = 2):
 # activation
 
 def leaky_relu(p = 0.1):
-    return nn.LeakyRelu(p)
+    return nn.LeakyReLU(p)
 
 # mapping network
 
@@ -422,11 +422,15 @@ class MappingNetwork(nn.Module):
         for i in range(depth):
             layers.extend([EqualLinear(dim, dim, lr_mul), leaky_relu()])
 
-        self.net = nn.Sequential(*layers)
+        self.net = nn.Sequential(
+            *layers,
+            nn.Linear(dim, dim * 4)
+        )
 
     def forward(self, x):
         x = F.normalize(x, dim=1)
-        return self.net(x)
+        x = self.net(x)
+        return rearrange(x, 'b (c h w) -> b c h w', h = 2, w = 2)
 
 # generative adversarial network
 
@@ -438,18 +442,23 @@ class Generator(nn.Module):
         latent_dim = 256,
         fmap_max = 512,
         fmap_inverse_coef = 12,
-        init_channels = 3
+        init_channels = 3,
+        mapping_network_depth = 4
     ):
         super().__init__()
         resolution = log2(image_size)
         assert is_power_of_two(image_size), 'image size must be a power of 2'
+        
+        self.mapping = MappingNetwork(latent_dim, mapping_network_depth)
+        self.initial_block = nn.Parameter(torch.randn((latent_dim, 4, 4)))
 
     def forward(self, x):
-        x = rearrange(x, 'b c -> b c () ()')
-        x = self.initial_conv(x)
-        x = F.normalize(x, dim = 1)
+        b = x.shape[0]
 
-        return
+        style_latents = self.mapping(x)
+        fmap = repeat(self.initial_block, 'c h w -> b c h w', b = b)
+
+        return x
 
 class SimpleDecoder(nn.Module):
     def __init__(
@@ -461,7 +470,7 @@ class SimpleDecoder(nn.Module):
     ):
         super().__init__()
 
-        self.layers = nn.ModuleList([])
+        layers = nn.ModuleList([])
         final_chan = chan_out
         chans = chan_in
 
@@ -473,13 +482,13 @@ class SimpleDecoder(nn.Module):
                 nn.Conv2d(chans, chan_out, 3, padding = 1),
                 nn.GLU(dim = 1)
             )
-            self.layers.append(layer)
+            layers.append(layer)
             chans //= 2
 
+        self.net = nn.Sequential(*layers)
+
     def forward(self, x):
-        for layer in self.layers:
-            x = layer(x)
-        return x
+        return self.net(x)
 
 class Discriminator(nn.Module):
     def __init__(
@@ -506,33 +515,12 @@ class Discriminator(nn.Module):
 
     def forward(self, x, calc_aux_loss = False):
         orig_img = x
-
-        for layer in self.non_residual_layers:
-            x = layer(x)
-
-        layer_outputs = []
-
-        for net in self.residual_layers:
-            x = net(x)
-            layer_outputs.append(x)
-
-        out = self.to_logits(x).flatten(1)
+        out = x
 
         if not calc_aux_loss:
             return out, None
 
-        # self-supervised auto-encoding loss
-
-        layer_8x8 = layer_outputs[-1]
-
-        recon_img_8x8 = self.decoder(layer_8x8)
-
-        aux_loss = F.mse_loss(
-            recon_img_8x8,
-            F.interpolate(orig_img, size = recon_img_8x8.shape[2:])
-        )
-
-        return out, aux_loss
+        return out, 0
 
 class Transganformer(nn.Module):
     def __init__(
