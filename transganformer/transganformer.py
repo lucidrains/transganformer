@@ -163,8 +163,8 @@ class Residual(nn.Module):
         super().__init__()
         self.fn = fn
 
-    def forward(self, x):
-        return self.fn(x) + x
+    def forward(self, x, **kwargs):
+        return self.fn(x, **kwargs) + x
 
 # attention and transformer modules
 
@@ -181,13 +181,20 @@ class ChanNorm(nn.Module):
         return (x - mean) / (std + self.eps) * self.g + self.b
 
 class PreNorm(nn.Module):
-    def __init__(self, dim, fn):
+    def __init__(self, dim, fn, dim_context = None):
         super().__init__()
         self.norm = ChanNorm(dim)
+        self.norm_context = ChanNorm(dim_context) if exists(dim_context) else None
         self.fn = fn
 
     def forward(self, x, **kwargs):
         x = self.norm(x)
+
+        if exists(self.norm_context):
+            context = kwargs.pop('context')
+            context = self.norm_context(context)
+            kwargs.update(context = context)
+
         return self.fn(x, **kwargs)
 
 class DepthWiseConv2d(nn.Module):
@@ -241,7 +248,7 @@ class Attention(nn.Module):
             nn.Conv2d(inner_dim, dim_out, out_kernel_size, padding = out_padding)
         )
 
-    def forward(self, x, context = None, mask = None):
+    def forward(self, x, context = None):
         b, n, _, y, h, device = *x.shape, self.heads, x.device
         context = default(context, x)
 
@@ -290,11 +297,20 @@ class LinearAttention(nn.Module):
         return self.to_out(out)
 
 class ResFilmUpdate(nn.Module):
-    def forward(self, x, res, eps = 1e-5):
+    def __init__(self, fn, eps = 1e-5):
+        super().__init__()
+        self.eps = eps
+        self.fn = fn
+
+    def forward(self, x, **kwargs):
+        res = x
+        out = self.fn(x, **kwargs)
+
         std = torch.var(res, dim = 1, unbiased = False, keepdim = True).sqrt()
         mean = torch.mean(res, dim = 1, keepdim = True)
-        norm_res = (res - mean) / (std + eps)
-        g, b = x.chunk(2, dim = 1)
+        norm_res = (res - mean) / (std + self.eps)
+
+        g, b = out.chunk(2, dim = 1)
         return norm_res * g + b
 
 # dataset
@@ -497,6 +513,8 @@ class Generator(nn.Module):
             self.layers.append(nn.ModuleList([
                 upsample,
                 Residual(PreNorm(chan, attn_class(chan))),
+                ResFilmUpdate(PreNorm(chan, Attention(chan, kv_dim = latent_dim, dim_out = chan * 2))),
+                ResFilmUpdate(PreNorm(latent_dim, Attention(latent_dim, kv_dim = chan, dim_out = latent_dim * 2))),
                 Residual(PreNorm(chan, FeedForward(chan))),
             ]))
 
@@ -507,12 +525,19 @@ class Generator(nn.Module):
     def forward(self, x):
         b = x.shape[0]
 
-        style_latents = self.mapping(x)
+        latents = self.mapping(x)
         fmap = repeat(self.initial_block, 'c h w -> b c h w', b = b)
 
-        for upsample, attn, ff in self.layers:
+        for upsample, attn, fmap_to_latents_attn, latents_to_fmap_attn, ff in self.layers:
             fmap = upsample(fmap)
             fmap = attn(fmap)
+
+            if exists(fmap_to_latents_attn):
+                fmap = fmap_to_latents_attn(fmap, context = latents)
+
+            if exists(latents_to_fmap_attn):
+                latents = latents_to_fmap_attn(latents, context = fmap)
+
             fmap = ff(fmap)
 
         return self.to_img(fmap)
