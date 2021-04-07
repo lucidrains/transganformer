@@ -590,7 +590,7 @@ class Discriminator(nn.Module):
         self.layers = nn.ModuleList([])
         for _ in range(num_layers):
             self.layers.append(nn.ModuleList([
-                Residual(PreNorm(fmap_max, Attention(dim = fmap_max))),
+                Residual(PreNorm(fmap_max, LinearAttention(dim = fmap_max))),
                 Residual(PreNorm(fmap_max, FeedForward(dim = fmap_max)))
             ]))
 
@@ -614,7 +614,7 @@ class Discriminator(nn.Module):
         if not calc_aux_loss:
             return x, None
 
-        return x, 0
+        return x, torch.tensor(0)
 
 class Transganformer(nn.Module):
     def __init__(
@@ -746,7 +746,7 @@ class Trainer():
 
         self.config_path = self.models_dir / name / '.config.json'
 
-        assert is_power_of_two(image_size), 'image size must be a power of 2 (64, 128, 256, 512, 1024)'
+        assert is_power_of_two(image_size), 'image size must be a power of 2 (32, 64, 128, 256, 512, 1024)'
 
         self.image_size = image_size
         self.num_image_tiles = num_image_tiles
@@ -983,7 +983,7 @@ class Trainer():
                 generated_images = G(latents)
 
                 fake_output, _ = D_aug(generated_images, **aug_kwargs)
-                real_output, _ = D_aug(image_batch, **aug_kwargs) if G_requires_calc_real else (None, None, None)
+                real_output, _ = D_aug(image_batch, **aug_kwargs) if G_requires_calc_real else (None, None)
 
                 loss = G_loss_fn(fake_output, real_output)
 
