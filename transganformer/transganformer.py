@@ -168,6 +168,14 @@ class Residual(nn.Module):
     def forward(self, x, **kwargs):
         return self.fn(x, **kwargs) + x
 
+class SumBranches(nn.Module):
+    def __init__(self, branches):
+        super().__init__()
+        self.branches = nn.ModuleList(branches)
+
+    def forward(self, x):
+        return sum(map(lambda fn: fn(x), self.branches))
+
 # attention and transformer modules
 
 class ChanNorm(nn.Module):
@@ -493,6 +501,11 @@ class Generator(nn.Module):
         chan = latent_dim
         min_chan = 16
 
+        self.latent_transformer = nn.Sequential(
+            Residual(PreNorm(latent_dim, Attention(latent_dim))),
+            Residual(PreNorm(latent_dim, FeedForward(latent_dim)))
+        )
+
         for ind in range(num_layers):
             is_last = ind == (num_layers - 1)
 
@@ -501,10 +514,17 @@ class Generator(nn.Module):
 
                 chan_out = max(min_chan, chan // 2)
 
-                upsample = nn.Sequential(
-                    DepthWiseConv2d(chan, chan_out * 4, 3, padding = 1),
-                    nn.PixelShuffle(2)
-                )
+                upsample = SumBranches([
+                    nn.Sequential(
+                        DepthWiseConv2d(chan, chan_out * 4, 3, padding = 1),
+                        nn.PixelShuffle(2)
+                    ),
+                    nn.Sequential(
+                        nn.Upsample(scale_factor = 2),
+                        nn.Conv2d(chan, chan_out, 3, padding = 1),
+                        leaky_relu()
+                    )
+                ])
 
                 chan = chan_out
             else:
@@ -539,6 +559,8 @@ class Generator(nn.Module):
 
             if exists(latents_to_fmap_attn):
                 latents = latents_to_fmap_attn(latents, context = fmap)
+
+                latents = self.latent_transformer(latents)
 
             fmap = ff(fmap)
 
@@ -599,9 +621,18 @@ class Discriminator(nn.Module):
 
             attn_class = Attention if image_size <= 16 else partial(HaloAttention, block_size = 8, halo_size = 4)
 
+            downsample = SumBranches([
+                DepthWiseConv2d(fmap_max, fmap_max, 3, stride = 2, padding = 1),
+                nn.Sequential(
+                    nn.AvgPool2d(2),
+                    nn.Conv2d(fmap_max, fmap_max, 1),
+                    leaky_relu()
+                )
+            ])
+
             self.layers.append(nn.ModuleList([
                 Residual(PreNorm(fmap_max, attn_class(dim = fmap_max))),
-                DepthWiseConv2d(fmap_max, fmap_max, 3, stride = 2, padding = 1),
+                downsample,
                 Residual(PreNorm(fmap_max, FeedForward(dim = fmap_max)))
             ]))
 
