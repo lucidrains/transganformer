@@ -463,11 +463,46 @@ class Generator(nn.Module):
         mapping_network_depth = 4
     ):
         super().__init__()
-        resolution = log2(image_size)
         assert is_power_of_two(image_size), 'image size must be a power of 2'
+        num_layers = int(log2(image_size)) - 1
         
         self.mapping = MappingNetwork(latent_dim, mapping_network_depth)
         self.initial_block = nn.Parameter(torch.randn((latent_dim, 4, 4)))
+
+        self.layers = nn.ModuleList([])
+
+        fmap_size = 4
+        chan = latent_dim
+        min_chan = 16
+
+        for ind in range(num_layers):
+            is_last = ind == (num_layers - 1)
+
+            if not is_last:
+                fmap_size *= 2
+
+                chan_out = max(min_chan, chan // 2)
+
+                upsample = nn.Sequential(
+                    DepthWiseConv2d(chan, chan_out * 4, 3, padding = 1),
+                    nn.PixelShuffle(2)
+                )
+
+                chan = chan_out
+            else:
+                upsample = nn.Identity()
+
+            attn_class = Attention if ind < 4 else LinearAttention
+
+            self.layers.append(nn.ModuleList([
+                upsample,
+                Residual(PreNorm(chan, attn_class(chan))),
+                Residual(PreNorm(chan, FeedForward(chan))),
+            ]))
+
+        self.to_img = nn.Sequential(
+            nn.Conv2d(chan, init_channel, 1)
+        )
 
     def forward(self, x):
         b = x.shape[0]
@@ -475,7 +510,12 @@ class Generator(nn.Module):
         style_latents = self.mapping(x)
         fmap = repeat(self.initial_block, 'c h w -> b c h w', b = b)
 
-        return x
+        for upsample, attn, ff in self.layers:
+            fmap = upsample(fmap)
+            fmap = attn(fmap)
+            fmap = ff(fmap)
+
+        return self.to_img(fmap)
 
 class SimpleDecoder(nn.Module):
     def __init__(
