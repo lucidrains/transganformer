@@ -212,27 +212,33 @@ class Attention(nn.Module):
     def __init__(
         self,
         dim,
+        dim_out = None,
         kv_dim = None,
         heads = 8,
         dim_head = 64,
         q_kernel_size = 1,
-        kv_kernel_size = 3
+        kv_kernel_size = 3,
+        out_kernel_size = 1,
+        q_stride = 1
     ):
         super().__init__()
         inner_dim = dim_head *  heads
         kv_dim = default(kv_dim, dim)
+        dim_out = default(dim_out, dim)
+
         self.heads = heads
         self.scale = dim_head ** -0.5
 
         q_padding = q_kernel_size // 2
         kv_padding = kv_kernel_size // 2
+        out_padding = out_kernel_size // 2
 
-        self.to_q = nn.Conv2d(dim, inner_dim, q_kernel_size, padding = q_padding, bias = False)
+        self.to_q = nn.Conv2d(dim, inner_dim, q_kernel_size, stride = q_stride, padding = q_padding, bias = False)
         self.to_kv = nn.Conv2d(kv_dim, inner_dim * 2, kv_kernel_size, padding = kv_padding, bias = False)
 
         self.to_out = nn.Sequential(
             nn.GELU(),
-            nn.Conv2d(inner_dim, dim, 1)
+            nn.Conv2d(inner_dim, dim_out, out_kernel_size, padding = out_padding)
         )
 
     def forward(self, x, context = None, mask = None):
@@ -240,6 +246,9 @@ class Attention(nn.Module):
         context = default(context, x)
 
         qkv = (self.to_q(x), *self.to_kv(context).chunk(2, dim = 1))
+
+        out_h, out_w = qkv[0].shape[-2:]
+
         q, k, v = map(lambda t: rearrange(t, 'b (h d) x y -> (b h) (x y) d', h = h), qkv)
 
         dots = torch.einsum('b i d, b j d -> b i j', q, k) * self.scale
@@ -247,7 +256,7 @@ class Attention(nn.Module):
         attn = dots.softmax(dim=-1)
 
         out = torch.einsum('b i j, b j d -> b i d', attn, v)
-        out = rearrange(out, '(b h) (x y) d -> b (h d) x y', h = h, y = y)
+        out = rearrange(out, '(b h) (x y) d -> b (h d) x y', h = h, x = out_h, y = out_w)
         return self.to_out(out)
 
 class LinearAttention(nn.Module):
