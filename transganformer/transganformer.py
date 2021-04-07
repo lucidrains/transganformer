@@ -514,24 +514,18 @@ class Generator(nn.Module):
 
         for ind in range(num_layers):
             is_last = ind == (num_layers - 1)
-            attn_class = Attention if fmap_size <= 16 else partial(HaloAttention, block_size = 16, halo_size = 4)
+            attn_class = Attention if fmap_size <= 32 else partial(HaloAttention, block_size = 32, halo_size = 4)
 
             if not is_last:
                 fmap_size *= 2
 
                 chan_out = max(min_chan, chan // 2)
 
-                upsample = SumBranches([
-                    nn.Sequential(
-                        nn.ConvTranspose2d(chan, chan_out, 4, padding = 1, stride = 2),
-                        PreNorm(chan_out, Attention(chan_out, dim_head = chan_out, heads = 1))
-                    ),
-                    nn.Sequential(
-                        nn.Upsample(scale_factor = 2),
-                        nn.Conv2d(chan, chan_out, 3, padding = 1),
-                        leaky_relu()
-                    )
-                ])
+                upsample = nn.Sequential(
+                    nn.Upsample(scale_factor = 2),
+                    nn.Conv2d(chan, chan_out, 3, padding = 1),
+                    leaky_relu()
+                )
 
                 chan = chan_out
             else:
@@ -649,7 +643,7 @@ class Discriminator(nn.Module):
 
             fmap_dim = fmap_dim_out
 
-        self.aux_decoder = SimpleDecoder(chan_in = fmap_dim, chan_out = init_channel, num_upsamples = 5)
+        self.aux_decoder = SimpleDecoder(chan_in = fmap_dim, chan_out = init_channel, num_upsamples = min(num_layers + 1, 5))
 
         self.to_logits = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
@@ -676,7 +670,7 @@ class Discriminator(nn.Module):
         if not calc_aux_loss:
             return x, None
 
-        recon = self.aux_decoder(fmaps[3])
+        recon = self.aux_decoder(fmaps[-1])
         recon_loss = F.mse_loss(x_, recon)
         return x, recon_loss
 
