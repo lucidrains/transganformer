@@ -217,11 +217,11 @@ class DepthWiseConv2d(nn.Module):
     def forward(self, x):
         return self.net(x)
 
-def FeedForward(dim, mult = 2, kernel_size = 1):
+def FeedForward(dim, mult = 2, kernel_size = 3):
     padding = kernel_size // 2
     return nn.Sequential(
-        nn.Conv2d(dim, dim * mult, kernel_size, padding = padding),
-        nn.GELU(),
+        nn.Conv2d(dim, dim * mult * 2, kernel_size, padding = padding),
+        GEGLU(),
         nn.Conv2d(dim * mult, dim, kernel_size, padding = padding)
     )
 
@@ -251,11 +251,11 @@ class Attention(nn.Module):
         out_padding = out_kernel_size // 2
 
         self.to_q = nn.Conv2d(dim, inner_dim, q_kernel_size, stride = q_stride, padding = q_padding, bias = False)
-        self.to_kv = nn.Conv2d(kv_dim, inner_dim * 2, kv_kernel_size, padding = kv_padding, bias = False)
+        self.to_kv = nn.Conv2d(kv_dim, inner_dim * 2, 1, bias = False)
 
         self.to_out = nn.Sequential(
             nn.GELU(),
-            nn.Conv2d(inner_dim, dim_out, out_kernel_size, padding = out_padding)
+            nn.Conv2d(inner_dim, dim_out, 3, padding = 1)
         )
 
     def forward(self, x, context = None):
@@ -270,7 +270,7 @@ class Attention(nn.Module):
 
         dots = torch.einsum('b i d, b j d -> b i j', q, k) * self.scale
 
-        attn = dots.softmax(dim=-1)
+        attn = dots.softmax(dim = -1)
 
         out = torch.einsum('b i j, b j d -> b i d', attn, v)
         out = rearrange(out, '(b h) (x y) d -> b (h d) x y', h = h, x = out_h, y = out_w)
@@ -284,7 +284,7 @@ class LinearAttention(nn.Module):
         inner_dim = dim_head * heads
 
         self.to_q = nn.Conv2d(dim, inner_dim, 1, bias = False)
-        self.to_kv = DepthWiseConv2d(dim, inner_dim * 2, 3, padding = 1, bias = False)
+        self.to_kv = DepthWiseConv2d(dim, inner_dim * 2, 1, bias = False)
         self.to_out = nn.Sequential(
             nn.GELU(),
             nn.Conv2d(inner_dim, dim, 1)
@@ -306,6 +306,11 @@ class LinearAttention(nn.Module):
 
         return self.to_out(out)
 
+class GEGLU(nn.Module):
+    def forward(self, x):
+        x, gates = x.chunk(2, dim = 1)
+        return x * gates.sigmoid()
+
 class ResFilmUpdate(nn.Module):
     def __init__(self, fn, eps = 1e-5):
         super().__init__()
@@ -315,6 +320,8 @@ class ResFilmUpdate(nn.Module):
     def forward(self, x, **kwargs):
         res = x
         out = self.fn(x, **kwargs)
+
+        return res + nn.GLU(dim = 1)(out)
 
         std = torch.var(res, dim = 1, unbiased = False, keepdim = True).sqrt()
         mean = torch.mean(res, dim = 1, keepdim = True)
@@ -484,7 +491,6 @@ class Generator(nn.Module):
         image_size,
         latent_dim = 256,
         fmap_max = 512,
-        fmap_inverse_coef = 12,
         init_channel = 3,
         mapping_network_depth = 4
     ):
@@ -502,12 +508,13 @@ class Generator(nn.Module):
         min_chan = 16
 
         self.latent_transformer = nn.Sequential(
-            Residual(PreNorm(latent_dim, Attention(latent_dim))),
+            Residual(PreNorm(latent_dim, Attention(latent_dim, heads = 4))),
             Residual(PreNorm(latent_dim, FeedForward(latent_dim)))
         )
 
         for ind in range(num_layers):
             is_last = ind == (num_layers - 1)
+            attn_class = Attention if fmap_size <= 16 else partial(HaloAttention, block_size = 16, halo_size = 4)
 
             if not is_last:
                 fmap_size *= 2
@@ -516,8 +523,8 @@ class Generator(nn.Module):
 
                 upsample = SumBranches([
                     nn.Sequential(
-                        DepthWiseConv2d(chan, chan_out * 4, 3, padding = 1),
-                        nn.PixelShuffle(2)
+                        nn.ConvTranspose2d(chan, chan_out, 4, padding = 1, stride = 2),
+                        PreNorm(chan_out, Attention(chan_out, dim_head = chan_out, heads = 1))
                     ),
                     nn.Sequential(
                         nn.Upsample(scale_factor = 2),
@@ -530,7 +537,6 @@ class Generator(nn.Module):
             else:
                 upsample = nn.Identity()
 
-            attn_class = Attention if fmap_size <= 16 else partial(HaloAttention, block_size = 16, halo_size = 4)
 
             self.layers.append(nn.ModuleList([
                 upsample,
@@ -548,6 +554,8 @@ class Generator(nn.Module):
         b = x.shape[0]
 
         latents = self.mapping(x)
+        latents = self.latent_transformer(latents)
+
         fmap = repeat(self.initial_block, 'c h w -> b c h w', b = b)
 
         for upsample, attn, fmap_to_latents_attn, latents_to_fmap_attn, ff in self.layers:
@@ -602,14 +610,16 @@ class Discriminator(nn.Module):
         *,
         image_size,
         fmap_max = 256,
-        fmap_inverse_coef = 12,
         init_channel = 3,
     ):
         super().__init__()
         assert is_power_of_two(image_size), 'image size must be a power of 2'
-        num_layers = int(log2(image_size)) - 1
+        num_layers = int(log2(image_size)) - 2
+        fmap_dim = 32
 
-        self.conv_embed = nn.Conv2d(init_channel, fmap_max, kernel_size = 7, stride = 2, padding = 3)
+        self.conv_embed = nn.Sequential(
+            nn.Conv2d(init_channel, fmap_dim, kernel_size = 4, stride = 2, padding = 1)
+        )
 
         image_size //= 2
 
@@ -620,28 +630,31 @@ class Discriminator(nn.Module):
             self.image_sizes.append(image_size)
 
             attn_class = Attention if image_size <= 16 else partial(HaloAttention, block_size = 8, halo_size = 4)
+            fmap_dim_out = min(fmap_dim * 2, fmap_max)
 
             downsample = SumBranches([
-                DepthWiseConv2d(fmap_max, fmap_max, 3, stride = 2, padding = 1),
+                nn.Conv2d(fmap_dim, fmap_dim_out, 3, stride = 2, padding = 1),
                 nn.Sequential(
                     nn.AvgPool2d(2),
-                    nn.Conv2d(fmap_max, fmap_max, 1),
+                    nn.Conv2d(fmap_dim, fmap_dim_out, 3, padding = 1),
                     leaky_relu()
                 )
             ])
 
             self.layers.append(nn.ModuleList([
-                Residual(PreNorm(fmap_max, attn_class(dim = fmap_max))),
                 downsample,
-                Residual(PreNorm(fmap_max, FeedForward(dim = fmap_max)))
+                Residual(PreNorm(fmap_dim_out, attn_class(dim = fmap_dim_out))),
+                Residual(PreNorm(fmap_dim_out, FeedForward(dim = fmap_dim_out)))
             ]))
 
-        self.aux_decoder = SimpleDecoder(chan_in = fmap_max, chan_out = init_channel)
+            fmap_dim = fmap_dim_out
+
+        self.aux_decoder = SimpleDecoder(chan_in = fmap_dim, chan_out = init_channel, num_upsamples = 5)
 
         self.to_logits = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
             Rearrange('b c () () -> b c'),
-            nn.Linear(fmap_max, 1),
+            nn.Linear(fmap_dim, 1),
             Rearrange('b () -> b')
         )
 
@@ -651,9 +664,9 @@ class Discriminator(nn.Module):
 
         fmaps = []
 
-        for (attn, downsample, ff), image_size in zip(self.layers, self.image_sizes):
-            x = attn(x)
+        for (downsample, attn, ff), image_size in zip(self.layers, self.image_sizes):
             x = downsample(x)
+            x = attn(x)
             x = ff(x)
 
             fmaps.append(x)
@@ -663,7 +676,7 @@ class Discriminator(nn.Module):
         if not calc_aux_loss:
             return x, None
 
-        recon = self.aux_decoder(fmaps[2])
+        recon = self.aux_decoder(fmaps[3])
         recon_loss = F.mse_loss(x_, recon)
         return x, recon_loss
 
@@ -674,7 +687,6 @@ class Transganformer(nn.Module):
         latent_dim,
         image_size,
         fmap_max = 512,
-        fmap_inverse_coef = 12,
         transparent = False,
         greyscale = False,
         ttur_mult = 1.,
@@ -697,7 +709,6 @@ class Transganformer(nn.Module):
             image_size = image_size,
             latent_dim = latent_dim,
             fmap_max = fmap_max,
-            fmap_inverse_coef = fmap_inverse_coef,
             init_channel = init_channel
         )
 
@@ -706,7 +717,6 @@ class Transganformer(nn.Module):
         self.D = Discriminator(
             image_size = image_size,
             fmap_max = fmap_max,
-            fmap_inverse_coef = fmap_inverse_coef,
             init_channel = init_channel
         )
 
