@@ -229,6 +229,7 @@ class Attention(nn.Module):
     def __init__(
         self,
         dim,
+        fmap_size = None,
         dim_out = None,
         kv_dim = None,
         heads = 8,
@@ -236,7 +237,8 @@ class Attention(nn.Module):
         q_kernel_size = 1,
         kv_kernel_size = 3,
         out_kernel_size = 1,
-        q_stride = 1
+        q_stride = 1,
+        bn = False
     ):
         super().__init__()
         inner_dim = dim_head *  heads
@@ -250,30 +252,74 @@ class Attention(nn.Module):
         kv_padding = kv_kernel_size // 2
         out_padding = out_kernel_size // 2
 
-        self.to_q = nn.Conv2d(dim, inner_dim, q_kernel_size, stride = q_stride, padding = q_padding, bias = False)
-        self.to_kv = nn.Conv2d(kv_dim, inner_dim * 2, 1, bias = False)
+        self.to_q = nn.Sequential(
+            nn.Conv2d(dim, inner_dim, q_kernel_size, stride = q_stride, padding = q_padding, bias = False),
+            nn.BatchNorm2d(inner_dim) if bn else nn.Identity()
+        )
+
+        self.to_k = nn.Sequential(
+            nn.Conv2d(kv_dim, inner_dim, 1, bias = False),
+            nn.BatchNorm2d(inner_dim) if bn else nn.Identity()
+        )
+
+        self.to_v = nn.Sequential(
+            nn.Conv2d(kv_dim, inner_dim, 1, bias = False),
+            nn.BatchNorm2d(inner_dim) if bn else nn.Identity()
+        )
 
         self.to_out = nn.Sequential(
             nn.GELU(),
-            nn.Conv2d(inner_dim, dim_out, 3, padding = 1)
+            nn.Conv2d(inner_dim, dim_out, 3, padding = 1),
+            nn.BatchNorm2d(dim_out) if bn else nn.Identity()
         )
 
+        self.fmap_size = fmap_size
+
+        if exists(self.fmap_size):
+            # positional bias
+
+            self.pos_bias = nn.Embedding(fmap_size * fmap_size, heads)
+
+            q_range = torch.arange(fmap_size)
+            k_range = torch.arange(fmap_size)
+
+            q_pos = torch.stack(torch.meshgrid(q_range, q_range), dim = -1)
+            k_pos = torch.stack(torch.meshgrid(k_range, k_range), dim = -1)
+
+            q_pos, k_pos = map(lambda t: rearrange(t, 'i j c -> (i j) c'), (q_pos, k_pos))
+            rel_pos = (q_pos[:, None, ...] - k_pos[None, :, ...]).abs()
+
+            x_rel, y_rel = rel_pos.unbind(dim = -1)
+            pos_indices = (x_rel * fmap_size) + y_rel
+
+            self.register_buffer('pos_indices', pos_indices)
+
+    def apply_pos_bias(self, fmap):
+        bias = self.pos_bias(self.pos_indices)
+        bias = rearrange(bias, 'i j h -> () h i j')
+        return fmap + bias
+
     def forward(self, x, context = None):
+        assert not exists(self.fmap_size) or x.shape[-1] == self.fmap_size, 'fmap size must equal the given shape'
+
         b, n, _, y, h, device = *x.shape, self.heads, x.device
         context = default(context, x)
 
-        qkv = (self.to_q(x), *self.to_kv(context).chunk(2, dim = 1))
+        qkv = (self.to_q(x), self.to_k(context), self.to_v(context))
 
         out_h, out_w = qkv[0].shape[-2:]
 
-        q, k, v = map(lambda t: rearrange(t, 'b (h d) x y -> (b h) (x y) d', h = h), qkv)
+        q, k, v = map(lambda t: rearrange(t, 'b (h d) x y -> b h (x y) d', h = h), qkv)
 
-        dots = torch.einsum('b i d, b j d -> b i j', q, k) * self.scale
+        dots = torch.einsum('b h i d, b h j d -> b h i j', q, k) * self.scale
+
+        if exists(self.fmap_size):
+            dots = self.apply_pos_bias(dots)
 
         attn = dots.softmax(dim = -1)
 
-        out = torch.einsum('b i j, b j d -> b i d', attn, v)
-        out = rearrange(out, '(b h) (x y) d -> b (h d) x y', h = h, x = out_h, y = out_w)
+        out = torch.einsum('b h i j, b h j d -> b h i d', attn, v)
+        out = rearrange(out, 'b h (x y) d -> b (h d) x y', h = h, x = out_h, y = out_w)
         return self.to_out(out)
 
 class LinearAttention(nn.Module):
@@ -287,7 +333,8 @@ class LinearAttention(nn.Module):
         self.to_kv = DepthWiseConv2d(dim, inner_dim * 2, 1, bias = False)
         self.to_out = nn.Sequential(
             nn.GELU(),
-            nn.Conv2d(inner_dim, dim, 1)
+            nn.Conv2d(inner_dim, dim, 1),
+            nn.BatchNorm2d(dim)
         )
 
     def forward(self, fmap):
@@ -321,7 +368,7 @@ class ResFilmUpdate(nn.Module):
         res = x
         out = self.fn(x, **kwargs)
 
-        return res + nn.GLU(dim = 1)(out)
+        # return res + nn.GLU(dim = 1)(out)
 
         std = torch.var(res, dim = 1, unbiased = False, keepdim = True).sqrt()
         mean = torch.mean(res, dim = 1, keepdim = True)
@@ -514,7 +561,6 @@ class Generator(nn.Module):
 
         for ind in range(num_layers):
             is_last = ind == (num_layers - 1)
-            attn_class = Attention if fmap_size <= 32 else partial(HaloAttention, block_size = 32, halo_size = 4)
 
             if not is_last:
                 fmap_size *= 2
@@ -522,27 +568,28 @@ class Generator(nn.Module):
                 chan_out = max(min_chan, chan // 2)
 
                 upsample = nn.Sequential(
-                    nn.Upsample(scale_factor = 2),
-                    nn.Conv2d(chan, chan_out, 3, padding = 1),
-                    leaky_relu()
+                    PreNorm(chan, Attention(chan, dim_head = chan, heads = 1, dim_out = chan_out * 4)),
+                    nn.PixelShuffle(2)
                 )
 
                 chan = chan_out
             else:
                 upsample = nn.Identity()
 
+            attn_class = partial(Attention, bn = False, fmap_size = fmap_size) if fmap_size <= 32 else partial(HaloAttention, block_size = 32, halo_size = 4)
 
             self.layers.append(nn.ModuleList([
                 upsample,
                 Residual(PreNorm(chan, attn_class(dim = chan))),
                 ResFilmUpdate(PreNorm(chan, Attention(chan, kv_dim = latent_dim, dim_out = chan * 2), dim_context = latent_dim)),
                 ResFilmUpdate(PreNorm(latent_dim, Attention(latent_dim, kv_dim = chan, dim_out = latent_dim * 2), dim_context = chan)),
-                Residual(PreNorm(chan, FeedForward(chan))),
+                Residual(PreNorm(chan, FeedForward(chan, kernel_size = (3 if image_size > 64 else 1)))),
+                Residual(PreNorm(chan, attn_class(dim = chan))),
+                Residual(PreNorm(chan, FeedForward(chan, kernel_size = (3 if image_size > 64 else 1)))),
             ]))
 
-        self.to_img = nn.Sequential(
-            nn.Conv2d(chan, init_channel, 3, padding = 1)
-        )
+        self.fmap_norm = ChanNorm(latent_dim)
+        self.to_img = nn.Conv2d(chan, init_channel, 1)
 
     def forward(self, x):
         b = x.shape[0]
@@ -551,20 +598,22 @@ class Generator(nn.Module):
         latents = self.latent_transformer(latents)
 
         fmap = repeat(self.initial_block, 'c h w -> b c h w', b = b)
+        fmap = self.fmap_norm(fmap)
 
-        for upsample, attn, fmap_to_latents_attn, latents_to_fmap_attn, ff in self.layers:
+        for upsample, attn, fmap_to_latents_attn, latents_to_fmap_attn, ff, attn2, ff2 in self.layers:
             fmap = upsample(fmap)
+
             fmap = attn(fmap)
+            fmap = ff(fmap)
 
             if exists(fmap_to_latents_attn):
                 fmap = fmap_to_latents_attn(fmap, context = latents)
 
-            if exists(latents_to_fmap_attn):
-                latents = latents_to_fmap_attn(latents, context = fmap)
+            # if exists(latents_to_fmap_attn):
+            #     latents = latents_to_fmap_attn(latents, context = fmap)
 
-                latents = self.latent_transformer(latents)
-
-            fmap = ff(fmap)
+            fmap = attn2(fmap)
+            fmap = ff2(fmap)
 
         return self.to_img(fmap)
 
@@ -623,7 +672,6 @@ class Discriminator(nn.Module):
             image_size //= 2
             self.image_sizes.append(image_size)
 
-            attn_class = Attention if image_size <= 16 else partial(HaloAttention, block_size = 8, halo_size = 4)
             fmap_dim_out = min(fmap_dim * 2, fmap_max)
 
             downsample = SumBranches([
@@ -634,6 +682,8 @@ class Discriminator(nn.Module):
                     leaky_relu()
                 )
             ])
+
+            attn_class = partial(Attention, fmap_size = image_size) if image_size <= 16 else partial(HaloAttention, block_size = 8, halo_size = 4)
 
             self.layers.append(nn.ModuleList([
                 downsample,
