@@ -28,6 +28,7 @@ setup(
   install_requires=[
     'einops>=0.3',
     'fire',
+    'halonet-pytorch',
     'kornia',
     'numpy',
     'pillow',

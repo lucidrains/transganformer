@@ -31,6 +31,8 @@ from tqdm import tqdm
 from einops import rearrange, reduce, repeat
 from einops.layers.torch import Rearrange
 
+from halonet_pytorch import HaloAttention
+
 # asserts
 
 assert torch.cuda.is_available(), 'You need to have an Nvidia GPU with CUDA installed.'
@@ -508,18 +510,18 @@ class Generator(nn.Module):
             else:
                 upsample = nn.Identity()
 
-            attn_class = Attention if ind < 4 else LinearAttention
+            attn_class = Attention if fmap_size <= 16 else partial(HaloAttention, block_size = 16, halo_size = 4)
 
             self.layers.append(nn.ModuleList([
                 upsample,
-                Residual(PreNorm(chan, attn_class(chan))),
-                ResFilmUpdate(PreNorm(chan, Attention(chan, kv_dim = latent_dim, dim_out = chan * 2))),
-                ResFilmUpdate(PreNorm(latent_dim, Attention(latent_dim, kv_dim = chan, dim_out = latent_dim * 2))),
+                Residual(PreNorm(chan, attn_class(dim = chan))),
+                ResFilmUpdate(PreNorm(chan, Attention(chan, kv_dim = latent_dim, dim_out = chan * 2), dim_context = latent_dim)),
+                ResFilmUpdate(PreNorm(latent_dim, Attention(latent_dim, kv_dim = chan, dim_out = latent_dim * 2), dim_context = chan)),
                 Residual(PreNorm(chan, FeedForward(chan))),
             ]))
 
         self.to_img = nn.Sequential(
-            nn.Conv2d(chan, init_channel, 1)
+            nn.Conv2d(chan, init_channel, 3, padding = 1)
         )
 
     def forward(self, x):
@@ -583,16 +585,27 @@ class Discriminator(nn.Module):
     ):
         super().__init__()
         assert is_power_of_two(image_size), 'image size must be a power of 2'
-        num_layers = int(log2(image_size)) - 2
+        num_layers = int(log2(image_size)) - 1
 
-        self.conv_embed = nn.Conv2d(init_channel, fmap_max, kernel_size = 7, stride = 4, padding = 3)
+        self.conv_embed = nn.Conv2d(init_channel, fmap_max, kernel_size = 7, stride = 2, padding = 3)
 
+        image_size //= 2
+
+        self.image_sizes = []
         self.layers = nn.ModuleList([])
-        for _ in range(num_layers):
+        for ind in range(num_layers):
+            image_size //= 2
+            self.image_sizes.append(image_size)
+
+            attn_class = Attention if image_size <= 16 else partial(HaloAttention, block_size = 8, halo_size = 4)
+
             self.layers.append(nn.ModuleList([
-                Residual(PreNorm(fmap_max, LinearAttention(dim = fmap_max))),
+                Residual(PreNorm(fmap_max, attn_class(dim = fmap_max))),
+                DepthWiseConv2d(fmap_max, fmap_max, 3, stride = 2, padding = 1),
                 Residual(PreNorm(fmap_max, FeedForward(dim = fmap_max)))
             ]))
+
+        self.aux_decoder = SimpleDecoder(chan_in = fmap_max, chan_out = init_channel)
 
         self.to_logits = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
@@ -605,16 +618,23 @@ class Discriminator(nn.Module):
         x_ = x
         x = self.conv_embed(x)
 
-        for (attn, ff) in self.layers:
+        fmaps = []
+
+        for (attn, downsample, ff), image_size in zip(self.layers, self.image_sizes):
             x = attn(x)
+            x = downsample(x)
             x = ff(x)
+
+            fmaps.append(x)
 
         x = self.to_logits(x)
 
         if not calc_aux_loss:
             return x, None
 
-        return x, torch.tensor(0)
+        recon = self.aux_decoder(fmaps[2])
+        recon_loss = F.mse_loss(x_, recon)
+        return x, recon_loss
 
 class Transganformer(nn.Module):
     def __init__(
