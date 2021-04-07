@@ -289,6 +289,14 @@ class LinearAttention(nn.Module):
 
         return self.to_out(out)
 
+class ResFilmUpdate(nn.Module):
+    def forward(self, x, res, eps = 1e-5):
+        std = torch.var(res, dim = 1, unbiased = False, keepdim = True).sqrt()
+        mean = torch.mean(res, dim = 1, keepdim = True)
+        norm_res = (res - mean) / (std + eps)
+        g, b = x.chunk(2, dim = 1)
+        return norm_res * g + b
+
 # dataset
 
 def convert_image_to(img_type, image):
@@ -515,16 +523,8 @@ class Discriminator(nn.Module):
 
         resolution = int(resolution)
 
-        if transparent:
-            init_channel = 4
-        elif greyscale:
-            init_channel = 1
-        else:
-            init_channel = 3
-
     def forward(self, x, calc_aux_loss = False):
-        orig_img = x
-        out = x
+        x_ = x
 
         if not calc_aux_loss:
             return out, None
