@@ -267,6 +267,9 @@ class Attention(nn.Module):
             nn.BatchNorm2d(inner_dim) if bn else nn.Identity()
         )
 
+        self.mix_heads_pre = nn.Parameter(torch.randn(heads, heads))
+        self.mix_heads_post = nn.Parameter(torch.randn(heads, heads))
+
         self.to_out = nn.Sequential(
             nn.GELU(),
             nn.Conv2d(inner_dim, dim_out, 3, padding = 1),
@@ -311,12 +314,14 @@ class Attention(nn.Module):
 
         q, k, v = map(lambda t: rearrange(t, 'b (h d) x y -> b h (x y) d', h = h), qkv)
 
-        dots = torch.einsum('b h i d, b h j d -> b h i j', q, k) * self.scale
+        dots = einsum('b h i d, b h j d -> b h i j', q, k) * self.scale
+        dots = einsum('b h i j, h g -> b g i j', dots, self.mix_heads_pre)
 
         if exists(self.fmap_size):
             dots = self.apply_pos_bias(dots)
 
         attn = dots.softmax(dim = -1)
+        attn = einsum('b h i j, h g -> b g i j', attn, self.mix_heads_post)
 
         out = torch.einsum('b h i j, b h j d -> b h i d', attn, v)
         out = rearrange(out, 'b h (x y) d -> b (h d) x y', h = h, x = out_h, y = out_w)
@@ -569,7 +574,9 @@ class Generator(nn.Module):
 
                 upsample = nn.Sequential(
                     PreNorm(chan, Attention(chan, dim_head = chan, heads = 1, dim_out = chan_out * 4)),
-                    nn.PixelShuffle(2)
+                    nn.PixelShuffle(2),
+                    PreNorm(chan_out, Attention(chan_out, dim_head = chan_out, heads = 1)),
+                    PreNorm(chan_out, FeedForward(chan_out))
                 )
 
                 chan = chan_out
@@ -583,9 +590,7 @@ class Generator(nn.Module):
                 Residual(PreNorm(chan, attn_class(dim = chan))),
                 ResFilmUpdate(PreNorm(chan, Attention(chan, kv_dim = latent_dim, dim_out = chan * 2), dim_context = latent_dim)),
                 ResFilmUpdate(PreNorm(latent_dim, Attention(latent_dim, kv_dim = chan, dim_out = latent_dim * 2), dim_context = chan)),
-                Residual(PreNorm(chan, FeedForward(chan, kernel_size = (3 if image_size > 64 else 1)))),
-                Residual(PreNorm(chan, attn_class(dim = chan))),
-                Residual(PreNorm(chan, FeedForward(chan, kernel_size = (3 if image_size > 64 else 1)))),
+                Residual(PreNorm(chan, FeedForward(chan, kernel_size = (3 if image_size > 64 else 1))))
             ]))
 
         self.fmap_norm = ChanNorm(latent_dim)
@@ -600,7 +605,7 @@ class Generator(nn.Module):
         fmap = repeat(self.initial_block, 'c h w -> b c h w', b = b)
         fmap = self.fmap_norm(fmap)
 
-        for upsample, attn, fmap_to_latents_attn, latents_to_fmap_attn, ff, attn2, ff2 in self.layers:
+        for upsample, attn, fmap_to_latents_attn, latents_to_fmap_attn, ff in self.layers:
             fmap = upsample(fmap)
 
             fmap = attn(fmap)
@@ -609,11 +614,8 @@ class Generator(nn.Module):
             if exists(fmap_to_latents_attn):
                 fmap = fmap_to_latents_attn(fmap, context = latents)
 
-            # if exists(latents_to_fmap_attn):
-            #     latents = latents_to_fmap_attn(latents, context = fmap)
-
-            fmap = attn2(fmap)
-            fmap = ff2(fmap)
+            if exists(latents_to_fmap_attn):
+                latents = latents_to_fmap_attn(latents, context = fmap)
 
         return self.to_img(fmap)
 
