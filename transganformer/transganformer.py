@@ -217,11 +217,12 @@ class DepthWiseConv2d(nn.Module):
     def forward(self, x):
         return self.net(x)
 
-def FeedForward(dim, mult = 2, kernel_size = 3):
+def FeedForward(dim, mult = 2, kernel_size = 3, bn = False):
     padding = kernel_size // 2
     return nn.Sequential(
-        nn.Conv2d(dim, dim * mult * 2, kernel_size, padding = padding),
-        GEGLU(),
+        nn.Conv2d(dim, dim * mult, kernel_size, padding = padding),
+        nn.BatchNorm2d(dim * mult) if bn else nn.Identity(),
+        nn.GELU(),
         nn.Conv2d(dim * mult, dim, kernel_size, padding = padding)
     )
 
@@ -238,6 +239,7 @@ class Attention(nn.Module):
         kv_kernel_size = 3,
         out_kernel_size = 1,
         q_stride = 1,
+        include_self = False,
         bn = False
     ):
         super().__init__()
@@ -258,14 +260,19 @@ class Attention(nn.Module):
         )
 
         self.to_k = nn.Sequential(
-            nn.Conv2d(kv_dim, inner_dim, 1, bias = False),
+            nn.Conv2d(kv_dim, inner_dim, 3, padding = 1, bias = False),
             nn.BatchNorm2d(inner_dim) if bn else nn.Identity()
         )
 
         self.to_v = nn.Sequential(
-            nn.Conv2d(kv_dim, inner_dim, 1, bias = False),
+            nn.Conv2d(kv_dim, inner_dim, 3, padding = 1, bias = False),
             nn.BatchNorm2d(inner_dim) if bn else nn.Identity()
         )
+
+        self.include_self = include_self
+        if include_self:
+            self.to_self_k = nn.Conv2d(dim, inner_dim, 3, padding = 1, bias = False)
+            self.to_self_v = nn.Conv2d(dim, inner_dim, 3, padding = 1, bias = False)
 
         self.mix_heads_pre = nn.Parameter(torch.randn(heads, heads))
         self.mix_heads_post = nn.Parameter(torch.randn(heads, heads))
@@ -302,17 +309,27 @@ class Attention(nn.Module):
         bias = rearrange(bias, 'i j h -> () h i j')
         return fmap + bias
 
-    def forward(self, x, context = None):
+    def forward(self, x, context = None, include_self = False):
         assert not exists(self.fmap_size) or x.shape[-1] == self.fmap_size, 'fmap size must equal the given shape'
 
         b, n, _, y, h, device = *x.shape, self.heads, x.device
         context = default(context, x)
 
-        qkv = (self.to_q(x), self.to_k(context), self.to_v(context))
+        q, k, v = (self.to_q(x), self.to_k(context), self.to_v(context))
 
-        out_h, out_w = qkv[0].shape[-2:]
+        out_h, out_w = q.shape[-2:]
 
-        q, k, v = map(lambda t: rearrange(t, 'b (h d) x y -> b h (x y) d', h = h), qkv)
+        split_head = lambda t: rearrange(t, 'b (h d) x y -> b h (x y) d', h = h)
+
+        q, k, v = map(split_head, (q, k, v))
+
+        if self.include_self:
+            kx = self.to_self_k(x)
+            vx = self.to_self_v(x)
+            kx, vx = map(split_head, (kx, vx))
+
+            k = torch.cat((kx, k), dim = -2)
+            v = torch.cat((vx, v), dim = -2)
 
         dots = einsum('b h i d, b h j d -> b h i j', q, k) * self.scale
         dots = einsum('b h i j, h g -> b g i j', dots, self.mix_heads_pre)
@@ -559,11 +576,6 @@ class Generator(nn.Module):
         chan = latent_dim
         min_chan = 16
 
-        self.latent_transformer = nn.Sequential(
-            Residual(PreNorm(latent_dim, Attention(latent_dim, heads = 4))),
-            Residual(PreNorm(latent_dim, FeedForward(latent_dim)))
-        )
-
         for ind in range(num_layers):
             is_last = ind == (num_layers - 1)
 
@@ -573,37 +585,34 @@ class Generator(nn.Module):
                 chan_out = max(min_chan, chan // 2)
 
                 upsample = nn.Sequential(
-                    PreNorm(chan, Attention(chan, dim_head = chan, heads = 1, dim_out = chan_out * 4)),
+                    Attention(chan, dim_head = chan, heads = 1, dim_out = chan_out * 4, bn = True),
                     nn.PixelShuffle(2),
-                    PreNorm(chan_out, Attention(chan_out, dim_head = chan_out, heads = 1)),
-                    PreNorm(chan_out, FeedForward(chan_out))
+                    Residual(Attention(chan_out, dim_head = chan_out, heads = 1, bn = True)),
+                    Residual(FeedForward(chan_out, bn = True))
                 )
 
                 chan = chan_out
             else:
                 upsample = nn.Identity()
 
-            attn_class = partial(Attention, bn = False, fmap_size = fmap_size) if fmap_size <= 32 else partial(HaloAttention, block_size = 32, halo_size = 4)
+            attn_class = partial(Attention, bn = True, fmap_size = fmap_size) if fmap_size <= 32 else partial(HaloAttention, block_size = 32, halo_size = 4)
 
             self.layers.append(nn.ModuleList([
                 upsample,
-                Residual(PreNorm(chan, attn_class(dim = chan))),
+                Residual(attn_class(dim = chan)),
                 ResFilmUpdate(PreNorm(chan, Attention(chan, kv_dim = latent_dim, dim_out = chan * 2), dim_context = latent_dim)),
-                ResFilmUpdate(PreNorm(latent_dim, Attention(latent_dim, kv_dim = chan, dim_out = latent_dim * 2), dim_context = chan)),
-                Residual(PreNorm(chan, FeedForward(chan, kernel_size = (3 if image_size > 64 else 1))))
+                ResFilmUpdate(PreNorm(latent_dim, Attention(latent_dim, kv_dim = chan, dim_out = latent_dim * 2, include_self = True), dim_context = chan)),
+                Residual(FeedForward(chan, bn = True, kernel_size = (3 if image_size > 64 else 1)))
             ]))
 
-        self.fmap_norm = ChanNorm(latent_dim)
         self.to_img = nn.Conv2d(chan, init_channel, 1)
 
     def forward(self, x):
         b = x.shape[0]
 
         latents = self.mapping(x)
-        latents = self.latent_transformer(latents)
 
         fmap = repeat(self.initial_block, 'c h w -> b c h w', b = b)
-        fmap = self.fmap_norm(fmap)
 
         for upsample, attn, fmap_to_latents_attn, latents_to_fmap_attn, ff in self.layers:
             fmap = upsample(fmap)
@@ -611,11 +620,12 @@ class Generator(nn.Module):
             fmap = attn(fmap)
             fmap = ff(fmap)
 
+            fmap_  = fmap
             if exists(fmap_to_latents_attn):
-                fmap = fmap_to_latents_attn(fmap, context = latents)
+                fmap = fmap_to_latents_attn(fmap_, context = latents)
 
             if exists(latents_to_fmap_attn):
-                latents = latents_to_fmap_attn(latents, context = fmap)
+                latents = latents_to_fmap_attn(latents, context = fmap_)
 
         return self.to_img(fmap)
 
