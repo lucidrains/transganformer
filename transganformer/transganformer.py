@@ -31,8 +31,6 @@ from tqdm import tqdm
 from einops import rearrange, reduce, repeat
 from einops.layers.torch import Rearrange
 
-from halonet_pytorch import HaloAttention
-
 # asserts
 
 assert torch.cuda.is_available(), 'You need to have an Nvidia GPU with CUDA installed.'
@@ -226,6 +224,8 @@ def FeedForward(dim, mult = 2, kernel_size = 3, bn = False):
         nn.Conv2d(dim * mult, dim, kernel_size, padding = padding)
     )
 
+# classes
+
 class Attention(nn.Module):
     def __init__(
         self,
@@ -240,6 +240,8 @@ class Attention(nn.Module):
         out_kernel_size = 1,
         q_stride = 1,
         include_self = False,
+        no_overlap = False,
+        downsample = False,
         bn = False
     ):
         super().__init__()
@@ -254,32 +256,37 @@ class Attention(nn.Module):
         kv_padding = kv_kernel_size // 2
         out_padding = out_kernel_size // 2
 
+        q_conv_params = (1, 1, 0)
+
         self.to_q = nn.Sequential(
-            nn.Conv2d(dim, inner_dim, q_kernel_size, stride = q_stride, padding = q_padding, bias = False),
+            nn.Conv2d(dim, inner_dim, *q_conv_params, bias = False),
             nn.BatchNorm2d(inner_dim) if bn else nn.Identity()
         )
 
+        kv_conv_params = (1, 1, 0) if no_overlap else (3, 1, 1)
+
         self.to_k = nn.Sequential(
-            nn.Conv2d(kv_dim, inner_dim, 3, padding = 1, bias = False),
+            nn.Conv2d(kv_dim, inner_dim, *kv_conv_params, bias = False),
             nn.BatchNorm2d(inner_dim) if bn else nn.Identity()
         )
 
         self.to_v = nn.Sequential(
-            nn.Conv2d(kv_dim, inner_dim, 3, padding = 1, bias = False),
+            nn.Conv2d(kv_dim, inner_dim, *kv_conv_params, bias = False),
             nn.BatchNorm2d(inner_dim) if bn else nn.Identity()
         )
 
         self.include_self = include_self
         if include_self:
-            self.to_self_k = nn.Conv2d(dim, inner_dim, 3, padding = 1, bias = False)
-            self.to_self_v = nn.Conv2d(dim, inner_dim, 3, padding = 1, bias = False)
+            self.to_self_k = nn.Conv2d(dim, inner_dim, *kv_conv_params, bias = False)
+            self.to_self_v = nn.Conv2d(dim, inner_dim, *kv_conv_params, bias = False)
 
         self.mix_heads_pre = nn.Parameter(torch.randn(heads, heads))
         self.mix_heads_post = nn.Parameter(torch.randn(heads, heads))
 
+        out_conv_params = (3, 2, 1) if downsample else kv_conv_params
+
         self.to_out = nn.Sequential(
-            nn.GELU(),
-            nn.Conv2d(inner_dim, dim_out, 3, padding = 1),
+            nn.Conv2d(inner_dim, dim_out, *out_conv_params),
             nn.BatchNorm2d(dim_out) if bn else nn.Identity()
         )
 
@@ -345,18 +352,19 @@ class Attention(nn.Module):
         return self.to_out(out)
 
 class LinearAttention(nn.Module):
-    def __init__(self, dim, dim_head = 64, heads = 8):
+    def __init__(self, dim, dim_head = 64, heads = 8, dim_out = None):
         super().__init__()
+        dim_out = default(dim_out, dim)
         self.scale = dim_head ** -0.5
         self.heads = heads
         inner_dim = dim_head * heads
 
         self.to_q = nn.Conv2d(dim, inner_dim, 1, bias = False)
-        self.to_kv = DepthWiseConv2d(dim, inner_dim * 2, 1, bias = False)
+        self.to_kv = DepthWiseConv2d(dim, inner_dim * 2, 3, stride = 1, padding = 0, bias = False)
         self.to_out = nn.Sequential(
             nn.GELU(),
-            nn.Conv2d(inner_dim, dim, 1),
-            nn.BatchNorm2d(dim)
+            nn.Conv2d(inner_dim, dim_out, 1),
+            nn.BatchNorm2d(dim_out)
         )
 
     def forward(self, fmap):
@@ -378,7 +386,7 @@ class LinearAttention(nn.Module):
 class GEGLU(nn.Module):
     def forward(self, x):
         x, gates = x.chunk(2, dim = 1)
-        return x * gates.sigmoid()
+        return x * F.gelu(gates)
 
 class ResFilmUpdate(nn.Module):
     def __init__(self, fn, eps = 1e-5):
@@ -574,38 +582,40 @@ class Generator(nn.Module):
 
         fmap_size = 4
         chan = latent_dim
-        min_chan = 16
+        min_chan = 32
 
         for ind in range(num_layers):
             is_last = ind == (num_layers - 1)
 
-            if not is_last:
-                fmap_size *= 2
+            attn_class = partial(Attention, bn = True, fmap_size = fmap_size) if fmap_size <= 16 else LinearAttention
 
+            if not is_last:
                 chan_out = max(min_chan, chan // 2)
 
                 upsample = nn.Sequential(
-                    Attention(chan, dim_head = chan, heads = 1, dim_out = chan_out * 4, bn = True),
-                    nn.PixelShuffle(2),
-                    Residual(Attention(chan_out, dim_head = chan_out, heads = 1, bn = True)),
-                    Residual(FeedForward(chan_out, bn = True))
+                    attn_class(dim = chan, dim_head = chan, heads = 1, dim_out = chan_out * 4),
+                    nn.PixelShuffle(2)
                 )
 
-                chan = chan_out
             else:
                 upsample = nn.Identity()
 
-            attn_class = partial(Attention, bn = True, fmap_size = fmap_size) if fmap_size <= 32 else partial(HaloAttention, block_size = 32, halo_size = 4)
-
             self.layers.append(nn.ModuleList([
-                upsample,
+                ResFilmUpdate(Attention(chan, kv_dim = latent_dim, dim_out = chan * 2, bn = True, no_overlap = True)),
+                Residual(Attention(latent_dim, kv_dim = chan, dim_out = latent_dim, include_self = True, bn = True, no_overlap = True)),
                 Residual(attn_class(dim = chan)),
-                ResFilmUpdate(PreNorm(chan, Attention(chan, kv_dim = latent_dim, dim_out = chan * 2), dim_context = latent_dim)),
-                ResFilmUpdate(PreNorm(latent_dim, Attention(latent_dim, kv_dim = chan, dim_out = latent_dim * 2, include_self = True), dim_context = chan)),
-                Residual(FeedForward(chan, bn = True, kernel_size = (3 if image_size > 64 else 1)))
+                Residual(FeedForward(chan, bn = True, kernel_size = (3 if image_size > 64 else 1))),
+                upsample,
             ]))
 
-        self.to_img = nn.Conv2d(chan, init_channel, 1)
+            chan = chan_out
+            fmap_size *= 2
+
+        self.to_img = nn.Sequential(
+            Residual(Attention(chan, bn = True)),
+            Residual(FeedForward(chan_out, bn = True)),
+            nn.Conv2d(chan, init_channel, 1)
+        )
 
     def forward(self, x):
         b = x.shape[0]
@@ -614,18 +624,18 @@ class Generator(nn.Module):
 
         fmap = repeat(self.initial_block, 'c h w -> b c h w', b = b)
 
-        for upsample, attn, fmap_to_latents_attn, latents_to_fmap_attn, ff in self.layers:
-            fmap = upsample(fmap)
-
-            fmap = attn(fmap)
-            fmap = ff(fmap)
-
+        for fmap_to_latents_attn, latents_to_fmap_attn, attn, ff, upsample in self.layers:
             fmap_  = fmap
+
             if exists(fmap_to_latents_attn):
                 fmap = fmap_to_latents_attn(fmap_, context = latents)
 
             if exists(latents_to_fmap_attn):
                 latents = latents_to_fmap_attn(latents, context = fmap_)
+
+            fmap = attn(fmap)
+            fmap = ff(fmap)
+            fmap = upsample(fmap)
 
         return self.to_img(fmap)
 
@@ -670,16 +680,19 @@ class Discriminator(nn.Module):
         super().__init__()
         assert is_power_of_two(image_size), 'image size must be a power of 2'
         num_layers = int(log2(image_size)) - 2
-        fmap_dim = 32
+        fmap_dim = 64
 
         self.conv_embed = nn.Sequential(
-            nn.Conv2d(init_channel, fmap_dim, kernel_size = 4, stride = 2, padding = 1)
+            nn.Conv2d(init_channel, 32, kernel_size = 4, stride = 2, padding = 1),
+            nn.Conv2d(32, fmap_dim, kernel_size = 3, padding = 1)
         )
 
         image_size //= 2
 
         self.image_sizes = []
         self.layers = nn.ModuleList([])
+        fmap_dims = []
+
         for ind in range(num_layers):
             image_size //= 2
             self.image_sizes.append(image_size)
@@ -687,7 +700,7 @@ class Discriminator(nn.Module):
             fmap_dim_out = min(fmap_dim * 2, fmap_max)
 
             downsample = SumBranches([
-                nn.Conv2d(fmap_dim, fmap_dim_out, 3, stride = 2, padding = 1),
+                nn.Conv2d(fmap_dim, fmap_dim_out, 3, 2, 1),
                 nn.Sequential(
                     nn.AvgPool2d(2),
                     nn.Conv2d(fmap_dim, fmap_dim_out, 3, padding = 1),
@@ -695,7 +708,7 @@ class Discriminator(nn.Module):
                 )
             ])
 
-            attn_class = partial(Attention, fmap_size = image_size) if image_size <= 16 else partial(HaloAttention, block_size = 8, halo_size = 4)
+            attn_class = partial(Attention, fmap_size = image_size) if image_size <= 16 else partial(LinearAttention, heads = 16)
 
             self.layers.append(nn.ModuleList([
                 downsample,
@@ -704,14 +717,15 @@ class Discriminator(nn.Module):
             ]))
 
             fmap_dim = fmap_dim_out
+            fmap_dims.append(fmap_dim)
 
-        self.aux_decoder = SimpleDecoder(chan_in = fmap_dim, chan_out = init_channel, num_upsamples = min(num_layers + 1, 5))
+        self.aux_decoder = SimpleDecoder(chan_in = fmap_dims[-2], chan_out = init_channel, num_upsamples = min(num_layers, 4))
 
         self.to_logits = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            Rearrange('b c () () -> b c'),
-            nn.Linear(fmap_dim, 1),
-            Rearrange('b () -> b')
+            Residual(PreNorm(fmap_dim, Attention(dim = fmap_dim, fmap_size = 2))),
+            Residual(PreNorm(fmap_dim, FeedForward(dim = fmap_dim))),
+            nn.Conv2d(fmap_dim, 1, 2),
+            Rearrange('b () () () -> b')
         )
 
     def forward(self, x, calc_aux_loss = False):
@@ -732,7 +746,7 @@ class Discriminator(nn.Module):
         if not calc_aux_loss:
             return x, None
 
-        recon = self.aux_decoder(fmaps[-1])
+        recon = self.aux_decoder(fmaps[-2])
         recon_loss = F.mse_loss(x_, recon)
         return x, recon_loss
 
@@ -1094,13 +1108,15 @@ class Trainer():
 
             if G_requires_calc_real:
                 image_batch = next(self.loader).cuda(self.rank)
-                image_batch.requires_grad_()
 
             with amp_context():
                 generated_images = G(latents)
 
                 fake_output, _ = D_aug(generated_images, **aug_kwargs)
                 real_output, _ = D_aug(image_batch, **aug_kwargs) if G_requires_calc_real else (None, None)
+
+                if exists(real_output):
+                    real_output = real_output.detach()
 
                 loss = G_loss_fn(fake_output, real_output)
 
