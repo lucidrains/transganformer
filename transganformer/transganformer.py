@@ -612,7 +612,7 @@ class Generator(nn.Module):
             fmap_size *= 2
 
         self.to_img = nn.Sequential(
-            Residual(Attention(chan, bn = True)),
+            Residual(attn_class(chan)),
             Residual(FeedForward(chan_out, bn = True)),
             nn.Conv2d(chan, init_channel, 1)
         )
@@ -708,7 +708,7 @@ class Discriminator(nn.Module):
                 )
             ])
 
-            attn_class = partial(Attention, fmap_size = image_size) if image_size <= 16 else partial(LinearAttention, heads = 16)
+            attn_class = partial(Attention, fmap_size = image_size) if image_size <= 16 else LinearAttention
 
             self.layers.append(nn.ModuleList([
                 downsample,
