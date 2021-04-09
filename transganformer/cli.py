@@ -78,7 +78,7 @@ def train_from_folder(
     name = 'default',
     new = False,
     load_from = -1,
-    image_size = 256,
+    image_size = 32,
     fmap_max = 512,
     transparent = False,
     greyscale = False,

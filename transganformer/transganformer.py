@@ -242,6 +242,7 @@ class Attention(nn.Module):
         include_self = False,
         no_overlap = False,
         downsample = False,
+        downsample_kv = False,
         bn = False
     ):
         super().__init__()
@@ -263,7 +264,7 @@ class Attention(nn.Module):
             nn.BatchNorm2d(inner_dim) if bn else nn.Identity()
         )
 
-        kv_conv_params = (1, 1, 0) if no_overlap else (3, 1, 1)
+        kv_conv_params = (1, 1, 0) if no_overlap else (3, (2 if downsample_kv else 1), 1)
 
         self.to_k = nn.Sequential(
             nn.Conv2d(kv_dim, inner_dim, *kv_conv_params, bias = False),
@@ -280,13 +281,13 @@ class Attention(nn.Module):
             self.to_self_k = nn.Conv2d(dim, inner_dim, *kv_conv_params, bias = False)
             self.to_self_v = nn.Conv2d(dim, inner_dim, *kv_conv_params, bias = False)
 
-        self.mix_heads_pre = nn.Parameter(torch.randn(heads, heads))
         self.mix_heads_post = nn.Parameter(torch.randn(heads, heads))
 
-        out_conv_params = (3, 2, 1) if downsample else kv_conv_params
+        out_conv_params = (3, 2, 1) if downsample else q_conv_params
 
         self.to_out = nn.Sequential(
-            nn.Conv2d(inner_dim, dim_out, *out_conv_params),
+            nn.Conv2d(inner_dim, dim_out * 2, *out_conv_params),
+            nn.GLU(dim = 1),
             nn.BatchNorm2d(dim_out) if bn else nn.Identity()
         )
 
@@ -298,7 +299,7 @@ class Attention(nn.Module):
             self.pos_bias = nn.Embedding(fmap_size * fmap_size, heads)
 
             q_range = torch.arange(fmap_size)
-            k_range = torch.arange(fmap_size)
+            k_range = torch.arange(0, fmap_size, step = (2 if downsample_kv else 1))
 
             q_pos = torch.stack(torch.meshgrid(q_range, q_range), dim = -1)
             k_pos = torch.stack(torch.meshgrid(k_range, k_range), dim = -1)
@@ -339,7 +340,6 @@ class Attention(nn.Module):
             v = torch.cat((vx, v), dim = -2)
 
         dots = einsum('b h i d, b h j d -> b h i j', q, k) * self.scale
-        dots = einsum('b h i j, h g -> b g i j', dots, self.mix_heads_pre)
 
         if exists(self.fmap_size):
             dots = self.apply_pos_bias(dots)
@@ -363,7 +363,8 @@ class LinearAttention(nn.Module):
         self.to_kv = DepthWiseConv2d(dim, inner_dim * 2, 3, stride = 1, padding = 0, bias = False)
         self.to_out = nn.Sequential(
             nn.GELU(),
-            nn.Conv2d(inner_dim, dim_out, 1),
+            nn.Conv2d(inner_dim, dim_out * 2, 1),
+            nn.GLU(dim = 1),
             nn.BatchNorm2d(dim_out)
         )
 
@@ -405,7 +406,8 @@ class ResFilmUpdate(nn.Module):
         norm_res = (res - mean) / (std + self.eps)
 
         g, b = out.chunk(2, dim = 1)
-        return norm_res * g + b
+        gate = g.sigmoid()
+        return res * (1 - gate) + b * gate
 
 # dataset
 
@@ -587,7 +589,7 @@ class Generator(nn.Module):
         for ind in range(num_layers):
             is_last = ind == (num_layers - 1)
 
-            attn_class = partial(Attention, bn = True, fmap_size = fmap_size) if fmap_size <= 16 else LinearAttention
+            attn_class = partial(Attention, bn = True, fmap_size = fmap_size, downsample_kv = image_size >= 32)
 
             if not is_last:
                 chan_out = max(min_chan, chan // 2)
@@ -708,12 +710,12 @@ class Discriminator(nn.Module):
                 )
             ])
 
-            attn_class = partial(Attention, fmap_size = image_size) if image_size <= 16 else LinearAttention
+            attn_class = partial(Attention, fmap_size = image_size, downsample_kv = (image_size >= 32))
 
             self.layers.append(nn.ModuleList([
                 downsample,
                 Residual(PreNorm(fmap_dim_out, attn_class(dim = fmap_dim_out))),
-                Residual(PreNorm(fmap_dim_out, FeedForward(dim = fmap_dim_out)))
+                Residual(PreNorm(fmap_dim_out, FeedForward(dim = fmap_dim_out, kernel_size = (3 if image_size > 64 else 1))))
             ]))
 
             fmap_dim = fmap_dim_out
@@ -723,7 +725,7 @@ class Discriminator(nn.Module):
 
         self.to_logits = nn.Sequential(
             Residual(PreNorm(fmap_dim, Attention(dim = fmap_dim, fmap_size = 2))),
-            Residual(PreNorm(fmap_dim, FeedForward(dim = fmap_dim))),
+            Residual(PreNorm(fmap_dim, FeedForward(dim = fmap_dim, kernel_size = (3 if image_size > 64 else 1)))),
             nn.Conv2d(fmap_dim, 1, 2),
             Rearrange('b () () () -> b')
         )
