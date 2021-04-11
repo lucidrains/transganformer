@@ -147,8 +147,8 @@ class Residual(nn.Module):
         out = self.fn(x, **kwargs)
 
         if isinstance(out, tuple):
-            out, *rest = out
-            ret = (out + x, *rest)
+            out, latent = out
+            ret = (out + x, latent)
             return ret
 
         return x + out
@@ -287,7 +287,7 @@ class Attention(nn.Module):
         )
 
         self.fmap_size = fmap_size
-        self.pos_emb = RotaryEmbedding(dim_head)
+        self.pos_emb = RotaryEmbedding(dim_head, downsample_keys = downsample_kv)
 
     def forward(self, x, latents = None, context = None, include_self = False):
         assert not exists(self.fmap_size) or x.shape[-1] == self.fmap_size, 'fmap size must equal the given shape'
@@ -353,39 +353,6 @@ class Attention(nn.Module):
             return out, lout
 
         return out
-
-class LinearAttention(nn.Module):
-    def __init__(self, dim, dim_head = 64, heads = 8, dim_out = None):
-        super().__init__()
-        dim_out = default(dim_out, dim)
-        self.scale = dim_head ** -0.5
-        self.heads = heads
-        inner_dim = dim_head * heads
-
-        self.to_q = nn.Conv2d(dim, inner_dim, 1, bias = False)
-        self.to_kv = DepthWiseConv2d(dim, inner_dim * 2, 3, stride = 1, padding = 0, bias = False)
-        self.to_out = nn.Sequential(
-            nn.GELU(),
-            nn.Conv2d(inner_dim, dim_out * 2, 1),
-            nn.GLU(dim = 1),
-            nn.BatchNorm2d(dim_out)
-        )
-
-    def forward(self, fmap):
-        h, x, y = self.heads, *fmap.shape[-2:]
-        q, k, v = (self.to_q(fmap), *self.to_kv(fmap).chunk(2, dim = 1))
-        q, k, v = map(lambda t: rearrange(t, 'b (h c) x y -> (b h) (x y) c', h = h), (q, k, v))
-
-        q = q.softmax(dim = -1)
-        k = k.softmax(dim = -2)
-
-        q = q * self.scale
-
-        context = einsum('b n d, b n e -> b d e', k, v)
-        out = einsum('b n d, b d e -> b n e', q, context)
-        out = rearrange(out, '(b h) (x y) d -> b (h d) x y', h = h, x = x, y = y)
-
-        return self.to_out(out)
 
 # dataset
 
@@ -515,12 +482,25 @@ def rotate_every_two(x):
     x = torch.stack((-x2, x1), dim = -1)
     return rearrange(x, '... d j -> ... (d j)')
 
+def get_sin_cos(seq):
+    n = seq.shape[0]
+    x_sinu = repeat(seq, 'i d -> i j d', j = n)
+    y_sinu = repeat(seq, 'j d -> i j d', i = n)
+
+    sin = torch.cat((x_sinu.sin(), y_sinu.sin()), dim = -1)
+    cos = torch.cat((x_sinu.cos(), y_sinu.cos()), dim = -1)
+
+    sin, cos = map(lambda t: rearrange(t, 'i j d -> (i j) d'), (sin, cos))
+    sin, cos = map(lambda t: repeat(t, 'n d -> () () n (d j)', j = 2), (sin, cos))
+    return sin, cos
+
 # positional encoding
 
 class RotaryEmbedding(nn.Module):
-    def __init__(self, dim):
+    def __init__(self, dim, downsample_keys = False):
         super().__init__()
         self.dim = dim
+        self.downsample_keys = downsample_keys
 
     def forward(self, q, k):
         device, dtype, n = q.device, q.dtype, int(sqrt(q.shape[-2]))
@@ -533,15 +513,16 @@ class RotaryEmbedding(nn.Module):
 
         seq = seq * scales * pi
 
-        x_sinu = repeat(seq, 'i d -> i j d', j = n)
-        y_sinu = repeat(seq, 'j d -> i j d', i = n)
+        x = seq
+        y = seq
 
-        sin = torch.cat((x_sinu.sin(), y_sinu.sin()), dim = -1)
-        cos = torch.cat((x_sinu.cos(), y_sinu.cos()), dim = -1)
+        if self.downsample_keys:
+            y = reduce(y, '(j n) c -> j c', 'mean', n = 2)
 
-        sin, cos = map(lambda t: rearrange(t, 'i j d -> (i j) d'), (sin, cos))
-        sin, cos = map(lambda t: repeat(t, 'n d -> () () n (d j)', j = 2), (sin, cos))
-        q, k = map(lambda t: (t * cos) + (rotate_every_two(t) * sin), (q, k))
+        q_sin, q_cos = get_sin_cos(x)
+        k_sin, k_cos = get_sin_cos(y)
+        q = (q * q_cos) + (rotate_every_two(q) * q_sin)
+        k = (k * k_cos) + (rotate_every_two(k) * k_sin)
         return q, k
 
 # mapping network
@@ -604,7 +585,7 @@ class Generator(nn.Module):
         for ind in range(num_layers):
             is_last = ind == (num_layers - 1)
 
-            attn_class = partial(Attention, bn = True, fmap_size = fmap_size, downsample_kv = image_size >= 1024)
+            attn_class = partial(Attention, bn = True, fmap_size = fmap_size, downsample_kv = image_size >= 64)
 
             if not is_last:
                 chan_out = max(min_chan, chan // 2)
@@ -626,7 +607,7 @@ class Generator(nn.Module):
             chan = chan_out
             fmap_size *= 2
 
-        self.final_attn = Residual(PreNorm(chan, attn_class(chan)))
+        self.final_attn = Residual(PreNorm(chan, attn_class(chan, latent_dim = latent_dim)))
 
         self.to_img = nn.Sequential(
             Residual(FeedForward(chan_out, bn = True)),
@@ -647,7 +628,7 @@ class Generator(nn.Module):
             fmap = ff(fmap)
             fmap = upsample(fmap)
 
-        fmap = self.final_attn(fmap, latents = latents)
+        fmap, _ = self.final_attn(fmap, latents = latents)
         return self.to_img(fmap)
 
 class SimpleDecoder(nn.Module):
@@ -719,7 +700,7 @@ class Discriminator(nn.Module):
                 )
             ])
 
-            attn_class = partial(Attention, fmap_size = image_size, downsample_kv = (image_size >= 1024))
+            attn_class = partial(Attention, fmap_size = image_size, downsample_kv = (image_size >= 64))
 
             self.layers.append(nn.ModuleList([
                 downsample,
