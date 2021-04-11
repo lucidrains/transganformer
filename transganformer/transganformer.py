@@ -144,7 +144,14 @@ class Residual(nn.Module):
         self.fn = fn
 
     def forward(self, x, **kwargs):
-        return self.fn(x, **kwargs) + x
+        out = self.fn(x, **kwargs)
+
+        if isinstance(out, tuple):
+            out, *rest = out
+            ret = (out + x, *rest)
+            return ret
+
+        return x + out
 
 class SumBranches(nn.Module):
     def __init__(self, branches):
@@ -223,7 +230,8 @@ class Attention(nn.Module):
         no_overlap = False,
         downsample = False,
         downsample_kv = False,
-        bn = False
+        bn = False,
+        latent_dim = None
     ):
         super().__init__()
         inner_dim = dim_head *  heads
@@ -239,22 +247,29 @@ class Attention(nn.Module):
 
         q_conv_params = (1, 1, 0)
 
-        self.to_q = nn.Sequential(
-            nn.Conv2d(dim, inner_dim, *q_conv_params, bias = False),
-            nn.BatchNorm2d(inner_dim) if bn else nn.Identity()
-        )
+        self.to_q = nn.Conv2d(dim, inner_dim, *q_conv_params, bias = False)
 
         kv_conv_params = (1, 1, 0) if no_overlap else (3, (2 if downsample_kv else 1), 1)
 
-        self.to_k = nn.Sequential(
-            nn.Conv2d(kv_dim, inner_dim, *kv_conv_params, bias = False),
-            nn.BatchNorm2d(inner_dim) if bn else nn.Identity()
-        )
+        self.to_k = nn.Conv2d(kv_dim, inner_dim, *kv_conv_params, bias = False)
+        self.to_v = nn.Conv2d(kv_dim, inner_dim, *kv_conv_params, bias = False)
 
-        self.to_v = nn.Sequential(
-            nn.Conv2d(kv_dim, inner_dim, *kv_conv_params, bias = False),
-            nn.BatchNorm2d(inner_dim) if bn else nn.Identity()
-        )
+        self.bn = bn
+        if self.bn:
+            self.q_bn = nn.BatchNorm2d(inner_dim) if bn else nn.Identity()
+            self.k_bn = nn.BatchNorm2d(inner_dim) if bn else nn.Identity()
+            self.v_bn = nn.BatchNorm2d(inner_dim) if bn else nn.Identity()
+
+        self.has_latents = exists(latent_dim)
+        if self.has_latents:
+            self.latent_norm = ChanNorm(latent_dim)
+            self.latents_to_qkv = nn.Conv2d(latent_dim, inner_dim * 3, 1, bias = False)
+
+            self.latents_to_out = nn.Sequential(
+                nn.Conv2d(inner_dim, latent_dim * 2, 1),
+                nn.GLU(dim = 1),
+                nn.BatchNorm2d(latent_dim) if bn else nn.Identity()
+            )
 
         self.include_self = include_self
         if include_self:
@@ -274,7 +289,7 @@ class Attention(nn.Module):
         self.fmap_size = fmap_size
         self.pos_emb = RotaryEmbedding(dim_head)
 
-    def forward(self, x, context = None, include_self = False):
+    def forward(self, x, latents = None, context = None, include_self = False):
         assert not exists(self.fmap_size) or x.shape[-1] == self.fmap_size, 'fmap size must equal the given shape'
 
         b, n, _, y, h, device = *x.shape, self.heads, x.device
@@ -283,6 +298,11 @@ class Attention(nn.Module):
         context = default(context, x)
 
         q, k, v = (self.to_q(x), self.to_k(context), self.to_v(context))
+
+        if self.bn:
+            q = self.q_bn(q)
+            k = self.k_bn(k)
+            v = self.v_bn(v)
 
         out_h, out_w = q.shape[-2:]
 
@@ -301,14 +321,38 @@ class Attention(nn.Module):
             k = torch.cat((kx, k), dim = -2)
             v = torch.cat((vx, v), dim = -2)
 
+        if self.has_latents:
+            assert exists(latents), 'latents must be passed in'
+            latents = self.latent_norm(latents)
+            lq, lk, lv = self.latents_to_qkv(latents).chunk(3, dim = 1)
+            lq, lk, lv = map(split_head, (lq, lk, lv))
+
+            latent_shape = lq.shape
+            num_latents = lq.shape[-2]
+
+            q = torch.cat((lq, q), dim = -2)
+            k = torch.cat((lk, k), dim = -2)
+            v = torch.cat((lv, v), dim = -2)
+
         dots = einsum('b h i d, b h j d -> b h i j', q, k) * self.scale
 
         attn = dots.softmax(dim = -1)
         attn = einsum('b h i j, h g -> b g i j', attn, self.mix_heads_post)
 
         out = torch.einsum('b h i j, b h j d -> b h i d', attn, v)
+
+        if self.has_latents:
+            lout, out = out[..., :num_latents, :], out[..., num_latents:, :]
+            lout = rearrange(lout, 'b h (x y) d -> b (h d) x y', h = h, x = latents.shape[-2], y = latents.shape[-1])
+            lout = self.latents_to_out(lout)
+
         out = rearrange(out, 'b h (x y) d -> b (h d) x y', h = h, x = out_h, y = out_w)
-        return self.to_out(out)
+        out = self.to_out(out)
+
+        if self.has_latents:
+            return out, lout
+
+        return out
 
 class LinearAttention(nn.Module):
     def __init__(self, dim, dim_head = 64, heads = 8, dim_out = None):
@@ -342,26 +386,6 @@ class LinearAttention(nn.Module):
         out = rearrange(out, '(b h) (x y) d -> b (h d) x y', h = h, x = x, y = y)
 
         return self.to_out(out)
-
-class ResFilmUpdate(nn.Module):
-    def __init__(self, fn, eps = 1e-5):
-        super().__init__()
-        self.eps = eps
-        self.fn = fn
-
-    def forward(self, x, **kwargs):
-        res = x
-        out = self.fn(x, **kwargs)
-
-        # return res + nn.GLU(dim = 1)(out)
-
-        std = torch.var(res, dim = 1, unbiased = False, keepdim = True).sqrt()
-        mean = torch.mean(res, dim = 1, keepdim = True)
-        norm_res = (res - mean) / (std + self.eps)
-
-        g, b = out.chunk(2, dim = 1)
-        gate = g.sigmoid()
-        return res * (1 - gate) + b * gate
 
 # dataset
 
@@ -594,9 +618,7 @@ class Generator(nn.Module):
                 upsample = nn.Identity()
 
             self.layers.append(nn.ModuleList([
-                ResFilmUpdate(Attention(chan, kv_dim = latent_dim, dim_out = chan * 2, bn = True, no_overlap = True)),
-                Residual(Attention(latent_dim, kv_dim = chan, dim_out = latent_dim, include_self = True, bn = True, no_overlap = True)),
-                Residual(PreNorm(chan, attn_class(dim = chan))),
+                Residual(PreNorm(chan, attn_class(dim = chan, latent_dim = latent_dim))),
                 Residual(FeedForward(chan, bn = True, kernel_size = (3 if image_size > 64 else 1))),
                 upsample,
             ]))
@@ -604,8 +626,9 @@ class Generator(nn.Module):
             chan = chan_out
             fmap_size *= 2
 
+        self.final_attn = Residual(PreNorm(chan, attn_class(chan)))
+
         self.to_img = nn.Sequential(
-            Residual(PreNorm(chan, attn_class(chan))),
             Residual(FeedForward(chan_out, bn = True)),
             nn.Conv2d(chan, init_channel, 1)
         )
@@ -617,19 +640,14 @@ class Generator(nn.Module):
 
         fmap = repeat(self.initial_block, 'c h w -> b c h w', b = b)
 
-        for fmap_to_latents_attn, latents_to_fmap_attn, attn, ff, upsample in self.layers:
-            fmap_  = fmap
+        for attn, ff, upsample in self.layers:
+            fmap, latents_out = attn(fmap, latents = latents)
+            latents = latents + latents_out
 
-            if exists(fmap_to_latents_attn):
-                fmap = fmap_to_latents_attn(fmap_, context = latents)
-
-            if exists(latents_to_fmap_attn):
-                latents = latents_to_fmap_attn(latents, context = fmap_)
-
-            fmap = attn(fmap)
             fmap = ff(fmap)
             fmap = upsample(fmap)
 
+        fmap = self.final_attn(fmap, latents = latents)
         return self.to_img(fmap)
 
 class SimpleDecoder(nn.Module):
