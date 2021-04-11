@@ -114,26 +114,6 @@ def safe_div(n, d):
         res = float(f'{prefix}inf')
     return res
 
-# loss functions
-
-def gen_hinge_loss(fake, real):
-    return fake.mean()
-
-def hinge_loss(real, fake):
-    return (F.relu(1 + real) + F.relu(1 - fake)).mean()
-
-def dual_contrastive_loss(real_logits, fake_logits):
-    device = real_logits.device
-    real_logits, fake_logits = map(lambda t: rearrange(t, '... -> (...)'), (real_logits, fake_logits))
-
-    def loss_half(t1, t2):
-        t1 = rearrange(t1, 'i -> i ()')
-        t2 = repeat(t2, 'j -> i j', i = t1.shape[0])
-        t = torch.cat((t1, t2), dim = -1)
-        return F.cross_entropy(t, torch.zeros(t1.shape[0], device = device, dtype = torch.long))
-
-    return loss_half(real_logits, fake_logits) + loss_half(-fake_logits, -real_logits)
-
 # helper classes
 
 class NanException(Exception):
@@ -218,9 +198,9 @@ class DepthWiseConv2d(nn.Module):
 def FeedForward(dim, mult = 2, kernel_size = 3, bn = False):
     padding = kernel_size // 2
     return nn.Sequential(
-        nn.Conv2d(dim, dim * mult, kernel_size, padding = padding),
+        nn.Conv2d(dim, dim * mult * 2, kernel_size, padding = padding),
+        nn.GLU(dim = 1),
         nn.BatchNorm2d(dim * mult) if bn else nn.Identity(),
-        nn.GELU(),
         nn.Conv2d(dim * mult, dim, kernel_size, padding = padding)
     )
 
@@ -362,11 +342,6 @@ class LinearAttention(nn.Module):
         out = rearrange(out, '(b h) (x y) d -> b (h d) x y', h = h, x = x, y = y)
 
         return self.to_out(out)
-
-class GEGLU(nn.Module):
-    def forward(self, x):
-        x, gates = x.chunk(2, dim = 1)
-        return x * F.gelu(gates)
 
 class ResFilmUpdate(nn.Module):
     def __init__(self, fn, eps = 1e-5):
@@ -862,7 +837,6 @@ class Trainer():
         batch_size = 4,
         gp_weight = 10,
         gradient_accumulate_every = 1,
-        dual_contrast_loss = False,
         lr = 2e-4,
         lr_mlp = 1.,
         ttur_mult = 1.,
@@ -921,8 +895,6 @@ class Trainer():
         self.evaluate_every = evaluate_every
         self.save_every = save_every
         self.steps = 0
-
-        self.dual_contrast_loss = dual_contrast_loss
 
         self.d_loss = 0
         self.g_loss = 0
@@ -1043,13 +1015,6 @@ class Trainer():
 
         amp_context = autocast if self.amp else null_context
 
-        # discriminator loss fn
-
-        if self.dual_contrast_loss:
-            D_loss_fn = dual_contrastive_loss
-        else:
-            D_loss_fn = hinge_loss
-
         # train discriminator
 
         self.GAN.D_opt.zero_grad()
@@ -1069,7 +1034,7 @@ class Trainer():
                 real_output_loss = real_output
                 fake_output_loss = fake_output
 
-                divergence = D_loss_fn(real_output_loss, fake_output_loss)
+                divergence = (F.relu(1 + real_output_loss) + F.relu(1 - fake_output_loss)).mean()
                 disc_loss = divergence
 
                 aux_loss = real_aux_loss
@@ -1108,15 +1073,6 @@ class Trainer():
         self.D_scaler.step(self.GAN.D_opt)
         self.D_scaler.update()
 
-        # generator loss fn
-
-        if self.dual_contrast_loss:
-            G_loss_fn = dual_contrastive_loss
-            G_requires_calc_real = True
-        else:
-            G_loss_fn = gen_hinge_loss
-            G_requires_calc_real = False
-
         # train generator
 
         self.GAN.G_opt.zero_grad()
@@ -1124,19 +1080,12 @@ class Trainer():
         for i in gradient_accumulate_contexts(self.gradient_accumulate_every, self.is_ddp, ddps=[G, D_aug]):
             latents = torch.randn(batch_size, latent_dim).cuda(self.rank)
 
-            if G_requires_calc_real:
-                image_batch = next(self.loader).cuda(self.rank)
-
             with amp_context():
                 generated_images = G(latents)
 
                 fake_output, _ = D_aug(generated_images, **aug_kwargs)
-                real_output, _ = D_aug(image_batch, **aug_kwargs) if G_requires_calc_real else (None, None)
 
-                if exists(real_output):
-                    real_output = real_output.detach()
-
-                loss = G_loss_fn(fake_output, real_output)
+                loss = fake_output.mean()
 
                 gen_loss = loss
 
