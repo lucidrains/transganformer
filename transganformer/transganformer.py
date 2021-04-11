@@ -3,7 +3,7 @@ import json
 import multiprocessing
 from random import random
 import math
-from math import log2, floor
+from math import log2, floor, sqrt, log, pi
 from functools import partial
 from contextlib import contextmanager, ExitStack
 from pathlib import Path
@@ -292,35 +292,14 @@ class Attention(nn.Module):
         )
 
         self.fmap_size = fmap_size
-
-        if exists(self.fmap_size):
-            # positional bias
-
-            self.pos_bias = nn.Embedding(fmap_size * fmap_size, heads)
-
-            q_range = torch.arange(fmap_size)
-            k_range = torch.arange(0, fmap_size, step = (2 if downsample_kv else 1))
-
-            q_pos = torch.stack(torch.meshgrid(q_range, q_range), dim = -1)
-            k_pos = torch.stack(torch.meshgrid(k_range, k_range), dim = -1)
-
-            q_pos, k_pos = map(lambda t: rearrange(t, 'i j c -> (i j) c'), (q_pos, k_pos))
-            rel_pos = (q_pos[:, None, ...] - k_pos[None, :, ...]).abs()
-
-            x_rel, y_rel = rel_pos.unbind(dim = -1)
-            pos_indices = (x_rel * fmap_size) + y_rel
-
-            self.register_buffer('pos_indices', pos_indices)
-
-    def apply_pos_bias(self, fmap):
-        bias = self.pos_bias(self.pos_indices)
-        bias = rearrange(bias, 'i j h -> () h i j')
-        return fmap + bias
+        self.pos_emb = RotaryEmbedding(dim_head)
 
     def forward(self, x, context = None, include_self = False):
         assert not exists(self.fmap_size) or x.shape[-1] == self.fmap_size, 'fmap size must equal the given shape'
 
         b, n, _, y, h, device = *x.shape, self.heads, x.device
+
+        has_context = exists(context)
         context = default(context, x)
 
         q, k, v = (self.to_q(x), self.to_k(context), self.to_v(context))
@@ -331,6 +310,9 @@ class Attention(nn.Module):
 
         q, k, v = map(split_head, (q, k, v))
 
+        if not has_context:
+            q, k = self.pos_emb(q, k)
+
         if self.include_self:
             kx = self.to_self_k(x)
             vx = self.to_self_v(x)
@@ -340,9 +322,6 @@ class Attention(nn.Module):
             v = torch.cat((vx, v), dim = -2)
 
         dots = einsum('b h i d, b h j d -> b h i j', q, k) * self.scale
-
-        if exists(self.fmap_size):
-            dots = self.apply_pos_bias(dots)
 
         attn = dots.softmax(dim = -1)
         attn = einsum('b h i j, h g -> b g i j', attn, self.mix_heads_post)
@@ -529,6 +508,43 @@ def upsample(scale_factor = 2):
 def leaky_relu(p = 0.1):
     return nn.LeakyReLU(p)
 
+# rotary positional embedding helpers
+
+def rotate_every_two(x):
+    x = rearrange(x, '... (d j) -> ... d j', j = 2)
+    x1, x2 = x.unbind(dim = -1)
+    x = torch.stack((-x2, x1), dim = -1)
+    return rearrange(x, '... d j -> ... (d j)')
+
+# positional encoding
+
+class RotaryEmbedding(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.dim = dim
+
+    def forward(self, q, k):
+        device, dtype, n = q.device, q.dtype, int(sqrt(q.shape[-2]))
+
+        seq = torch.linspace(-1., 1., steps = n, device = device)
+        seq = seq.unsqueeze(-1)
+
+        scales = torch.logspace(1., log(10 / 2) / log(2), self.dim // 4, base = 2, device = device, dtype = dtype)
+        scales = scales[(*((None,) * (len(seq.shape) - 1)), Ellipsis)]
+
+        seq = seq * scales * pi
+
+        x_sinu = repeat(seq, 'i d -> i j d', j = n)
+        y_sinu = repeat(seq, 'j d -> i j d', i = n)
+
+        sin = torch.cat((x_sinu.sin(), y_sinu.sin()), dim = -1)
+        cos = torch.cat((x_sinu.cos(), y_sinu.cos()), dim = -1)
+
+        sin, cos = map(lambda t: rearrange(t, 'i j d -> (i j) d'), (sin, cos))
+        sin, cos = map(lambda t: repeat(t, 'n d -> () () n (d j)', j = 2), (sin, cos))
+        q, k = map(lambda t: (t * cos) + (rotate_every_two(t) * sin), (q, k))
+        return q, k
+
 # mapping network
 
 class EqualLinear(nn.Module):
@@ -589,7 +605,7 @@ class Generator(nn.Module):
         for ind in range(num_layers):
             is_last = ind == (num_layers - 1)
 
-            attn_class = partial(Attention, bn = True, fmap_size = fmap_size, downsample_kv = image_size >= 32)
+            attn_class = partial(Attention, bn = True, fmap_size = fmap_size, downsample_kv = image_size >= 1024)
 
             if not is_last:
                 chan_out = max(min_chan, chan // 2)
@@ -605,7 +621,7 @@ class Generator(nn.Module):
             self.layers.append(nn.ModuleList([
                 ResFilmUpdate(Attention(chan, kv_dim = latent_dim, dim_out = chan * 2, bn = True, no_overlap = True)),
                 Residual(Attention(latent_dim, kv_dim = chan, dim_out = latent_dim, include_self = True, bn = True, no_overlap = True)),
-                Residual(attn_class(dim = chan)),
+                Residual(PreNorm(chan, attn_class(dim = chan))),
                 Residual(FeedForward(chan, bn = True, kernel_size = (3 if image_size > 64 else 1))),
                 upsample,
             ]))
@@ -614,7 +630,7 @@ class Generator(nn.Module):
             fmap_size *= 2
 
         self.to_img = nn.Sequential(
-            Residual(attn_class(chan)),
+            Residual(PreNorm(chan, attn_class(chan))),
             Residual(FeedForward(chan_out, bn = True)),
             nn.Conv2d(chan, init_channel, 1)
         )
@@ -710,7 +726,7 @@ class Discriminator(nn.Module):
                 )
             ])
 
-            attn_class = partial(Attention, fmap_size = image_size, downsample_kv = (image_size >= 32))
+            attn_class = partial(Attention, fmap_size = image_size, downsample_kv = (image_size >= 1024))
 
             self.layers.append(nn.ModuleList([
                 downsample,
