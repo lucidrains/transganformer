@@ -227,7 +227,6 @@ class Attention(nn.Module):
         out_kernel_size = 1,
         q_stride = 1,
         include_self = False,
-        no_overlap = False,
         downsample = False,
         downsample_kv = 1,
         bn = False,
@@ -249,7 +248,14 @@ class Attention(nn.Module):
 
         self.to_q = nn.Conv2d(dim, inner_dim, *q_conv_params, bias = False)
 
-        kv_conv_params = (1, 1, 0) if no_overlap else (3, (2 if downsample_kv > 1 else 1), 1)
+        if downsample_kv == 1:
+            kv_conv_params = (3, 1, 1)
+        elif downsample_kv == 2:
+            kv_conv_params = (3, 2, 1)
+        elif downsample_kv == 4:
+            kv_conv_params = (7, 4, 3)
+        else:
+            raise ValueError(f'invalid downsample factor for key / values {downsample_kv}')
 
         self.to_k = nn.Conv2d(kv_dim, inner_dim, *kv_conv_params, bias = False)
         self.to_v = nn.Conv2d(kv_dim, inner_dim, *kv_conv_params, bias = False)
@@ -712,7 +718,7 @@ class Discriminator(nn.Module):
             fmap_dim = fmap_dim_out
             fmap_dims.append(fmap_dim)
 
-        self.aux_decoder = SimpleDecoder(chan_in = fmap_dims[-2], chan_out = init_channel, num_upsamples = min(num_layers, 4))
+        self.aux_decoder = SimpleDecoder(chan_in = fmap_dims[-2], chan_out = init_channel, num_upsamples = num_layers)
 
         self.to_logits = nn.Sequential(
             Residual(PreNorm(fmap_dim, Attention(dim = fmap_dim, fmap_size = 2))),
