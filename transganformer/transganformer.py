@@ -678,7 +678,7 @@ class Discriminator(nn.Module):
         super().__init__()
         assert is_power_of_two(image_size), 'image size must be a power of 2'
         num_layers = int(log2(image_size)) - 2
-        fmap_dim = 32
+        fmap_dim = 64
 
         self.conv_embed = nn.Sequential(
             nn.Conv2d(init_channel, 32, kernel_size = 4, stride = 2, padding = 1),
@@ -686,6 +686,8 @@ class Discriminator(nn.Module):
         )
 
         image_size //= 2
+        self.ax_pos_emb_h = nn.Parameter(torch.randn(image_size, fmap_dim))
+        self.ax_pos_emb_w = nn.Parameter(torch.randn(image_size, fmap_dim))
 
         self.image_sizes = []
         self.layers = nn.ModuleList([])
@@ -730,6 +732,9 @@ class Discriminator(nn.Module):
     def forward(self, x, calc_aux_loss = False):
         x_ = x
         x = self.conv_embed(x)
+
+        ax_pos_emb = rearrange(self.ax_pos_emb_h, 'h c -> () c h ()') + rearrange(self.ax_pos_emb_w, 'w c -> () c () w')
+        x += ax_pos_emb
 
         fmaps = []
 
