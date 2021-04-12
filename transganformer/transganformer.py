@@ -229,7 +229,7 @@ class Attention(nn.Module):
         include_self = False,
         no_overlap = False,
         downsample = False,
-        downsample_kv = False,
+        downsample_kv = 1,
         bn = False,
         latent_dim = None
     ):
@@ -249,7 +249,7 @@ class Attention(nn.Module):
 
         self.to_q = nn.Conv2d(dim, inner_dim, *q_conv_params, bias = False)
 
-        kv_conv_params = (1, 1, 0) if no_overlap else (3, (2 if downsample_kv else 1), 1)
+        kv_conv_params = (1, 1, 0) if no_overlap else (3, (2 if downsample_kv > 1 else 1), 1)
 
         self.to_k = nn.Conv2d(kv_dim, inner_dim, *kv_conv_params, bias = False)
         self.to_v = nn.Conv2d(kv_dim, inner_dim, *kv_conv_params, bias = False)
@@ -497,7 +497,7 @@ def get_sin_cos(seq):
 # positional encoding
 
 class RotaryEmbedding(nn.Module):
-    def __init__(self, dim, downsample_keys = False):
+    def __init__(self, dim, downsample_keys = 1):
         super().__init__()
         self.dim = dim
         self.downsample_keys = downsample_keys
@@ -516,8 +516,7 @@ class RotaryEmbedding(nn.Module):
         x = seq
         y = seq
 
-        if self.downsample_keys:
-            y = reduce(y, '(j n) c -> j c', 'mean', n = 2)
+        y = reduce(y, '(j n) c -> j c', 'mean', n = self.downsample_keys)
 
         q_sin, q_cos = get_sin_cos(x)
         k_sin, k_cos = get_sin_cos(y)
@@ -580,15 +579,16 @@ class Generator(nn.Module):
 
         fmap_size = 4
         chan = latent_dim
-        min_chan = 32
+        min_chan = 8
 
         for ind in range(num_layers):
             is_last = ind == (num_layers - 1)
 
-            attn_class = partial(Attention, bn = True, fmap_size = fmap_size, downsample_kv = image_size >= 64)
+            downsample_factor = int(2 ** max(log2(fmap_size) - log2(32), 0))
+            attn_class = partial(Attention, bn = True, fmap_size = fmap_size, downsample_kv = downsample_factor)
 
             if not is_last:
-                chan_out = max(min_chan, chan // 2)
+                chan_out = max(min_chan, chan // 4)
 
                 upsample = nn.Sequential(
                     attn_class(dim = chan, dim_head = chan, heads = 1, dim_out = chan_out * 4),
@@ -672,7 +672,7 @@ class Discriminator(nn.Module):
         super().__init__()
         assert is_power_of_two(image_size), 'image size must be a power of 2'
         num_layers = int(log2(image_size)) - 2
-        fmap_dim = 64
+        fmap_dim = 32
 
         self.conv_embed = nn.Sequential(
             nn.Conv2d(init_channel, 32, kernel_size = 4, stride = 2, padding = 1),
@@ -700,7 +700,8 @@ class Discriminator(nn.Module):
                 )
             ])
 
-            attn_class = partial(Attention, fmap_size = image_size, downsample_kv = (image_size >= 64))
+            downsample_factor = 2 ** max(log2(image_size) - log2(32), 0)
+            attn_class = partial(Attention, fmap_size = image_size, downsample_kv = downsample_factor)
 
             self.layers.append(nn.ModuleList([
                 downsample,
