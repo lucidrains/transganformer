@@ -202,13 +202,15 @@ class DepthWiseConv2d(nn.Module):
     def forward(self, x):
         return self.net(x)
 
-def FeedForward(dim, mult = 2, kernel_size = 3, bn = False):
+def FeedForward(dim, mult = 4, kernel_size = 3, bn = False):
     padding = kernel_size // 2
     return nn.Sequential(
-        nn.Conv2d(dim, dim * mult * 2, kernel_size, padding = padding),
+        nn.Conv2d(dim, dim * mult * 2, 1),
         nn.GLU(dim = 1),
         nn.BatchNorm2d(dim * mult) if bn else nn.Identity(),
-        nn.Conv2d(dim * mult, dim, kernel_size, padding = padding)
+        DepthWiseConv2d(dim * mult, dim * mult * 2, kernel_size, padding = padding),
+        nn.GLU(dim = 1),
+        nn.Conv2d(dim * mult, dim, 1)
     )
 
 # classes
@@ -606,7 +608,7 @@ class Generator(nn.Module):
 
             self.layers.append(nn.ModuleList([
                 Residual(PreNorm(chan, attn_class(dim = chan, latent_dim = latent_dim))),
-                Residual(FeedForward(chan, bn = True, kernel_size = (3 if image_size > 64 else 1))),
+                Residual(FeedForward(chan, bn = True, kernel_size = (3 if image_size > 4 else 1))),
                 upsample,
             ]))
 
@@ -714,7 +716,7 @@ class Discriminator(nn.Module):
             self.layers.append(nn.ModuleList([
                 downsample,
                 Residual(PreNorm(fmap_dim_out, attn_class(dim = fmap_dim_out))),
-                Residual(PreNorm(fmap_dim_out, FeedForward(dim = fmap_dim_out, kernel_size = (3 if image_size > 64 else 1))))
+                Residual(PreNorm(fmap_dim_out, FeedForward(dim = fmap_dim_out, kernel_size = (3 if image_size > 4 else 1))))
             ]))
 
             fmap_dim = fmap_dim_out
