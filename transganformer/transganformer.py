@@ -213,6 +213,26 @@ def FeedForward(dim, mult = 4, kernel_size = 3, bn = False):
         nn.Conv2d(dim * mult, dim, 1)
     )
 
+# sinusoidal embedding
+
+class FixedPositionalEmbedding(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        dim //= 2
+        inv_freq = 1. / (10000 ** (torch.arange(0, dim, 2).float() / dim))
+        self.register_buffer('inv_freq', inv_freq)
+
+    def forward(self, x):
+        h = torch.linspace(-1., 1., x.shape[-2], device = x.device).type_as(self.inv_freq)
+        w = torch.linspace(-1., 1., x.shape[-1], device = x.device).type_as(self.inv_freq)
+        sinu_inp_h = torch.einsum('i , j -> i j', h, self.inv_freq)
+        sinu_inp_w = torch.einsum('i , j -> i j', w, self.inv_freq)
+        sinu_inp_h = repeat(sinu_inp_h, 'h c -> () c h w', w = x.shape[-1])
+        sinu_inp_w = repeat(sinu_inp_w, 'w c -> () c h w', h = x.shape[-2])
+        sinu_inp = torch.cat((sinu_inp_w, sinu_inp_h), dim = 1)
+        emb = torch.cat((sinu_inp.sin(), sinu_inp.cos()), dim = 1)
+        return emb
+
 # classes
 
 class Attention(nn.Module):
@@ -235,6 +255,8 @@ class Attention(nn.Module):
         latent_dim = None
     ):
         super().__init__()
+        self.sinu_emb = FixedPositionalEmbedding(dim)
+
         inner_dim = dim_head *  heads
         kv_dim = default(kv_dim, dim)
         dim_out = default(dim_out, dim)
@@ -305,7 +327,16 @@ class Attention(nn.Module):
         has_context = exists(context)
         context = default(context, x)
 
-        q, k, v = (self.to_q(x), self.to_k(context), self.to_v(context))
+        q_inp = x
+        k_inp = context
+        v_inp = context
+
+        if not has_context:
+            sinu_emb = self.sinu_emb(context)
+            q_inp += sinu_emb
+            k_inp += sinu_emb
+
+        q, k, v = (self.to_q(q_inp), self.to_k(k_inp), self.to_v(v_inp))
 
         if self.bn:
             q = self.q_bn(q)
