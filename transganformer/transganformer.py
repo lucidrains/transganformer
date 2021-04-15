@@ -547,7 +547,7 @@ class RotaryEmbedding(nn.Module):
         seq = torch.linspace(-1., 1., steps = n, device = device)
         seq = seq.unsqueeze(-1)
 
-        scales = torch.logspace(1., log(10 / 2) / log(2), self.dim // 4, base = 2, device = device, dtype = dtype)
+        scales = torch.logspace(0., log(10 / 2) / log(2), self.dim // 4, base = 2, device = device, dtype = dtype)
         scales = scales[(*((None,) * (len(seq.shape) - 1)), Ellipsis)]
 
         seq = seq * scales * pi
