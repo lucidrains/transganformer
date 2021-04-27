@@ -1,1 +1,1 @@
-from lightweight_gan.lightweight_gan import LightweightGAN, Generator, Discriminator, Trainer, NanException
+from transganformer.transganformer import Transganformer, Generator, Discriminator, Trainer, NanException
